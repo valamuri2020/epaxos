@@ -1,0 +1,10 @@
+bin
+stable-store-replica*
+output*
+.DS_Store
+pkg
+src/golang.org
+src/github.com
+src/google.golang.org
+__pycache__
+

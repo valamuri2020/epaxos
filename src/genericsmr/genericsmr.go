@@ -13,17 +13,29 @@ import (
 	"rdtsc"
 	"state"
 	"time"
+	"timetrace"
 )
 
 const CHAN_BUFFER_SIZE = 200000
 
+type RPCMessage struct {
+	Message    fastrpc.Serializable
+	ReceivedAt int64 // Unix Nano UTC timestamp
+	From       int64 // The rid of the replica who sent this message
+}
+
 type RPCPair struct {
 	Obj  fastrpc.Serializable
-	Chan chan fastrpc.Serializable
+	Chan chan *RPCMessage
 }
 
 type Propose struct {
 	*genericsmrproto.Propose
+	Reply *bufio.Writer
+}
+
+type MetricsRequest struct {
+	*genericsmrproto.MetricsRequest
 	Reply *bufio.Writer
 }
 
@@ -44,14 +56,13 @@ type Replica struct {
 
 	State *state.State
 
-	ProposeChan chan *Propose // channel for client proposals
-	BeaconChan  chan *Beacon  // channel for beacons from peer replicas
+	ProposeChan chan *Propose        // channel for client proposals
+	BeaconChan  chan *Beacon         // channel for beacons from peer replicas
+	MetricsChan chan *MetricsRequest // channel to send metrics to experiment code
 
 	Shutdown bool
 
 	Thrifty bool // send only as many messages as strictly required?
-	Exec    bool // execute commands?
-	Dreply  bool // reply to client after command has been executed?
 	Beacon  bool // send beacons to detect how fast are the other replicas?
 
 	Durable     bool     // log to a stable store?
@@ -67,7 +78,7 @@ type Replica struct {
 	OnClientConnect chan bool
 }
 
-func NewReplica(id int, peerAddrList []string, thrifty bool, exec bool, dreply bool) *Replica {
+func NewReplica(id int, peerAddrList []string, thrifty bool) *Replica {
 	r := &Replica{
 		len(peerAddrList),
 		int32(id),
@@ -80,10 +91,9 @@ func NewReplica(id int, peerAddrList []string, thrifty bool, exec bool, dreply b
 		state.InitState(),
 		make(chan *Propose, CHAN_BUFFER_SIZE),
 		make(chan *Beacon, CHAN_BUFFER_SIZE),
+		make(chan *MetricsRequest, 1),
 		false,
 		thrifty,
-		exec,
-		dreply,
 		false,
 		false,
 		nil,
@@ -104,7 +114,14 @@ func NewReplica(id int, peerAddrList []string, thrifty bool, exec bool, dreply b
 		r.Ewma[i] = 0.0
 	}
 
+	timetrace.Init()
+
 	return r
+}
+
+// UTC unix nano
+func CurrentTime() int64 {
+	return time.Now().UTC().UnixNano()
 }
 
 /* Client API */
@@ -144,43 +161,8 @@ func (r *Replica) ConnectToPeers() {
 		r.Alive[i] = true
 		r.PeerReaders[i] = bufio.NewReader(r.Peers[i])
 		r.PeerWriters[i] = bufio.NewWriter(r.Peers[i])
-	}
-	<-done
-	log.Printf("Replica id: %d. Done connecting to peers\n", r.Id)
 
-	for rid, reader := range r.PeerReaders {
-		if int32(rid) == r.Id {
-			continue
-		}
-		go r.replicaListener(rid, reader)
-	}
-}
-
-func (r *Replica) ConnectToPeersNoListeners() {
-	var b [4]byte
-	bs := b[:4]
-	done := make(chan bool)
-
-	go r.waitForPeerConnections(done)
-
-	//connect to peers
-	for i := 0; i < int(r.Id); i++ {
-		for done := false; !done; {
-			if conn, err := net.Dial("tcp", r.PeerAddrList[i]); err == nil {
-				r.Peers[i] = conn
-				done = true
-			} else {
-				time.Sleep(1e9)
-			}
-		}
-		binary.LittleEndian.PutUint32(bs, uint32(r.Id))
-		if _, err := r.Peers[i].Write(bs); err != nil {
-			fmt.Println("Write id error:", err)
-			continue
-		}
-		r.Alive[i] = true
-		r.PeerReaders[i] = bufio.NewReader(r.Peers[i])
-		r.PeerWriters[i] = bufio.NewWriter(r.Peers[i])
+		go r.replicaListener(i, r.PeerReaders[i])
 	}
 	<-done
 	log.Printf("Replica id: %d. Done connecting to peers\n", r.Id)
@@ -207,6 +189,8 @@ func (r *Replica) waitForPeerConnections(done chan bool) {
 		r.PeerReaders[id] = bufio.NewReader(conn)
 		r.PeerWriters[id] = bufio.NewWriter(conn)
 		r.Alive[id] = true
+
+		go r.replicaListener(int(id), r.PeerReaders[id])
 	}
 
 	done <- true
@@ -220,6 +204,8 @@ func (r *Replica) WaitForClientConnections() {
 			log.Println("Accept error:", err)
 			continue
 		}
+
+		log.Println("Connected to client", conn.RemoteAddr())
 		go r.clientListener(conn)
 
 		r.OnClientConnect <- true
@@ -237,6 +223,8 @@ func (r *Replica) replicaListener(rid int, reader *bufio.Reader) {
 		if msgType, err = reader.ReadByte(); err != nil {
 			break
 		}
+
+		receivedAt := CurrentTime()
 
 		switch uint8(msgType) {
 
@@ -263,7 +251,7 @@ func (r *Replica) replicaListener(rid int, reader *bufio.Reader) {
 				if err = obj.Unmarshal(reader); err != nil {
 					break
 				}
-				rpair.Chan <- obj
+				rpair.Chan <- &RPCMessage{obj, receivedAt, int64(rid)}
 			} else {
 				log.Println("Error: received unknown message type")
 			}
@@ -274,7 +262,7 @@ func (r *Replica) replicaListener(rid int, reader *bufio.Reader) {
 func (r *Replica) clientListener(conn net.Conn) {
 	reader := bufio.NewReader(conn)
 	writer := bufio.NewWriter(conn)
-	var msgType byte //:= make([]byte, 1)
+	var msgType byte
 	var err error
 	for !r.Shutdown && err == nil {
 
@@ -292,20 +280,12 @@ func (r *Replica) clientListener(conn net.Conn) {
 			r.ProposeChan <- &Propose{prop, writer}
 			break
 
-		case genericsmrproto.READ:
-			read := new(genericsmrproto.Read)
-			if err = read.Unmarshal(reader); err != nil {
+		case genericsmrproto.METRICS_REQUEST:
+			metrics := new(genericsmrproto.MetricsRequest)
+			if err = metrics.Unmarshal(reader); err != nil {
 				break
 			}
-			//r.ReadChan <- read
-			break
-
-		case genericsmrproto.PROPOSE_AND_READ:
-			pr := new(genericsmrproto.ProposeAndRead)
-			if err = pr.Unmarshal(reader); err != nil {
-				break
-			}
-			//r.ProposeAndReadChan <- pr
+			r.MetricsChan <- &MetricsRequest{metrics, writer}
 			break
 		}
 	}
@@ -314,7 +294,7 @@ func (r *Replica) clientListener(conn net.Conn) {
 	}
 }
 
-func (r *Replica) RegisterRPC(msgObj fastrpc.Serializable, notify chan fastrpc.Serializable) uint8 {
+func (r *Replica) RegisterRPC(msgObj fastrpc.Serializable, notify chan *RPCMessage) uint8 {
 	code := r.rpcCode
 	r.rpcCode++
 	r.rpcTable[code] = &RPCPair{msgObj, notify}
@@ -328,24 +308,7 @@ func (r *Replica) SendMsg(peerId int32, code uint8, msg fastrpc.Serializable) {
 	w.Flush()
 }
 
-func (r *Replica) SendMsgNoFlush(peerId int32, code uint8, msg fastrpc.Serializable) {
-	w := r.PeerWriters[peerId]
-	w.WriteByte(code)
-	msg.Marshal(w)
-}
-
 func (r *Replica) ReplyPropose(reply *genericsmrproto.ProposeReply, w *bufio.Writer) {
-	//r.clientMutex.Lock()
-	//defer r.clientMutex.Unlock()
-	//w.WriteByte(genericsmrproto.PROPOSE_REPLY)
-	reply.Marshal(w)
-	w.Flush()
-}
-
-func (r *Replica) ReplyProposeTS(reply *genericsmrproto.ProposeReplyTS, w *bufio.Writer) {
-	//r.clientMutex.Lock()
-	//defer r.clientMutex.Unlock()
-	//w.WriteByte(genericsmrproto.PROPOSE_REPLY)
 	reply.Marshal(w)
 	w.Flush()
 }

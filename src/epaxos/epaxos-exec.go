@@ -1,10 +1,10 @@
 package epaxos
 
 import (
-	//    "state"
 	"epaxosproto"
 	"genericsmrproto"
 	"sort"
+	"state"
 	"time"
 )
 
@@ -23,6 +23,10 @@ type SCComponent struct {
 	color int8
 }
 
+var overallRoot *Instance
+var overallRep int32
+var overallInst int32
+
 func (e *Exec) executeCommand(replica int32, instance int32) bool {
 	if e.r.InstanceSpace[replica][instance] == nil {
 		return false
@@ -34,6 +38,10 @@ func (e *Exec) executeCommand(replica int32, instance int32) bool {
 	if inst.Status != epaxosproto.COMMITTED {
 		return false
 	}
+
+	overallRep = replica
+	overallInst = instance
+	overallRoot = inst
 
 	if !e.findSCC(inst) {
 		return false
@@ -69,19 +77,53 @@ func (e *Exec) strongconnect(v *Instance, index *int) bool {
 		inst := v.Deps[q]
 		for i := e.r.ExecedUpTo[q] + 1; i <= inst; i++ {
 			for e.r.InstanceSpace[q][i] == nil || e.r.InstanceSpace[q][i].Cmds == nil || v.Cmds == nil {
-				time.Sleep(1000 * 1000)
+				// Sarah update: in the original code this was time.Sleep(1000 * 1000)
+				return false
 			}
-			/*        if !state.Conflict(v.Command, e.r.InstanceSpace[q][i].Command) {
-			          continue
-			          }
-			*/
-			if e.r.InstanceSpace[q][i].Status == epaxosproto.EXECUTED {
+
+			w := e.r.InstanceSpace[q][i]
+
+			if w.Status == epaxosproto.EXECUTED {
 				continue
 			}
-			for e.r.InstanceSpace[q][i].Status != epaxosproto.COMMITTED {
-				time.Sleep(1000 * 1000)
+
+			// Instances that don't conflict can be skipped
+			conflict := false
+			for ci, _ := range v.Cmds {
+				for di, _ := range w.Cmds {
+					if state.Conflict(&v.Cmds[ci], &w.Cmds[di]) {
+						conflict = true
+					}
+				}
 			}
-			w := e.r.InstanceSpace[q][i]
+			if !conflict {
+				continue
+			}
+
+			// Don't need to wait for reads
+			allReads := true
+			for _, cmd := range w.Cmds {
+				if cmd.Op != state.GET {
+					allReads = false
+				}
+			}
+			if allReads {
+				continue
+			}
+
+			// Livelock fix: any instance that has a high seq and the root
+			// as a dependency will necessarily execute after it. (As will
+			// any of its dependencies the root wouldn't already know about.)
+			if e.r.infiniteFix &&
+				(w.Seq > overallRoot.Seq || (overallRep < q && w.Seq == overallRoot.Seq)) &&
+				w.Deps[overallRep] >= overallInst {
+				break
+			}
+
+			for e.r.InstanceSpace[q][i].Status != epaxosproto.COMMITTED {
+				// Sarah update: in the original code this was time.Sleep(1000 * 1000)
+				return false
+			}
 
 			if w.Index == 0 {
 				//e.strongconnect(w, index)
@@ -111,17 +153,22 @@ func (e *Exec) strongconnect(v *Instance, index *int) bool {
 		sort.Sort(nodeArray(list))
 		for _, w := range list {
 			for w.Cmds == nil {
-				time.Sleep(1000 * 1000)
+				// Sarah update: in the original code this was time.Sleep(1000 * 1000)
+				return false
 			}
 			for idx := 0; idx < len(w.Cmds); idx++ {
 				val := w.Cmds[idx].Execute(e.r.State)
-				if e.r.Dreply && w.lb != nil && w.lb.clientProposals != nil {
-					e.r.ReplyProposeTS(
-						&genericsmrproto.ProposeReplyTS{
+				if !state.AllBlindWrites(w.Cmds) &&
+					w.lb != nil && w.lb.clientProposals != nil {
+					e.r.ReplyPropose(
+						&genericsmrproto.ProposeReply{
 							TRUE,
 							w.lb.clientProposals[idx].CommandId,
 							val,
-							w.lb.clientProposals[idx].Timestamp},
+							// w.lb.clientProposals[idx].Timestamp
+							// Overload timestamp with time between commit and
+							// execution
+							time.Now().Sub(w.lb.commitTime).Nanoseconds()},
 						w.lb.clientProposals[idx].Reply)
 				}
 			}

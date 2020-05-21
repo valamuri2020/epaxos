@@ -1,21 +1,12 @@
 package state
 
-import (
-	"sync"
-	//"fmt"
-	//"code.google.com/p/leveldb-go/leveldb"
-	//"encoding/binary"
-)
-
 type Operation uint8
 
 const (
 	NONE Operation = iota
 	PUT
 	GET
-	DELETE
-	RLOCK
-	WLOCK
+	PUT_BLIND // Result not needed immediately
 )
 
 type Value int64
@@ -31,23 +22,11 @@ type Command struct {
 }
 
 type State struct {
-	mutex *sync.Mutex
 	Store map[Key]Value
-	//DB *leveldb.DB
 }
 
 func InitState() *State {
-	/*
-	   d, err := leveldb.Open("/Users/iulian/git/epaxos-batching/dpaxos/bin/db", nil)
-
-	   if err != nil {
-	       fmt.Printf("Leveldb open failed: %v\n", err)
-	   }
-
-	   return &State{d}
-	*/
-
-	return &State{new(sync.Mutex), make(map[Key]Value)}
+	return &State{make(map[Key]Value)}
 }
 
 func Conflict(gamma *Command, delta *Command) bool {
@@ -75,21 +54,8 @@ func IsRead(command *Command) bool {
 }
 
 func (c *Command) Execute(st *State) Value {
-	//fmt.Printf("Executing (%d, %d)\n", c.K, c.V)
-
-	//var key, value [8]byte
-
-	//    st.mutex.Lock()
-	//    defer st.mutex.Unlock()
-
 	switch c.Op {
-	case PUT:
-		/*
-		   binary.LittleEndian.PutUint64(key[:], uint64(c.K))
-		   binary.LittleEndian.PutUint64(value[:], uint64(c.V))
-		   st.DB.Set(key[:], value[:], nil)
-		*/
-
+	case PUT, PUT_BLIND:
 		st.Store[c.K] = c.V
 		return c.V
 
@@ -100,4 +66,31 @@ func (c *Command) Execute(st *State) Value {
 	}
 
 	return NIL
+}
+
+func AllReads(cmds []Command) bool {
+	for i := range cmds {
+		if cmds[i].Op != GET {
+			return false
+		}
+	}
+	return true
+}
+
+func AllWrites(cmds []Command) bool {
+	for i := range cmds {
+		if cmds[i].Op != PUT {
+			return false
+		}
+	}
+	return true
+}
+
+func AllBlindWrites(cmds []Command) bool {
+	for i := range cmds {
+		if cmds[i].Op != PUT_BLIND {
+			return false
+		}
+	}
+	return true
 }

@@ -2,264 +2,271 @@ package main
 
 import (
 	"bufio"
-	"dlog"
+	"context"
 	"flag"
 	"fmt"
 	"genericsmrproto"
+	"golang.org/x/sync/semaphore"
 	"log"
 	"masterproto"
 	"math/rand"
 	"net"
 	"net/rpc"
+	"os"
+	"poisson"
 	"runtime"
 	"state"
+	"sync"
 	"time"
+	"zipfian"
 )
 
 var masterAddr *string = flag.String("maddr", "", "Master address. Defaults to localhost")
-var masterPort *int = flag.Int("mport", 7087, "Master port.  Defaults to 7077.")
-var reqsNb *int = flag.Int("q", 5000, "Total number of requests. Defaults to 5000.")
-var writes *int = flag.Int("w", 100, "Percentage of updates (writes). Defaults to 100%.")
-var noLeader *bool = flag.Bool("e", false, "Egalitarian (no leader). Defaults to false.")
-var fast *bool = flag.Bool("f", false, "Fast Paxos: send message directly to all replicas. Defaults to false.")
-var rounds *int = flag.Int("r", 1, "Split the total number of requests into this many rounds, and do rounds sequentially. Defaults to 1.")
-var procs *int = flag.Int("p", 2, "GOMAXPROCS. Defaults to 2")
-var check = flag.Bool("check", false, "Check that every expected reply was received exactly once.")
-var eps *int = flag.Int("eps", 0, "Send eps more messages per round than the client will wait for (to discount stragglers). Defaults to 0.")
-var conflicts *int = flag.Int("c", -1, "Percentage of conflicts. Defaults to 0%")
-var s = flag.Float64("s", 2, "Zipfian s parameter")
-var v = flag.Float64("v", 1, "Zipfian v parameter")
+var masterPort *int = flag.Int("mport", 7087, "Master port.")
+var procs *int = flag.Int("p", 2, "GOMAXPROCS.")
+var conflicts *int = flag.Int("c", 0, "Percentage of conflicts. If -1, uses Zipfian distribution.")
+var forceLeader = flag.Int("l", -1, "Force client to talk to a certain replica.")
+var startRange = flag.Int("sr", 0, "Key range start")
+var T = flag.Int("T", 10, "Number of threads (simulated clients).")
+var outstandingReqs = flag.Int64("or", 1, "Number of outstanding requests a thread can have at any given time.")
+var theta = flag.Float64("theta", 0.99, "Theta zipfian parameter")
+var zKeys = flag.Uint64("z", 1e9, "Number of unique keys in zipfian distribution.")
+var poissonAvg = flag.Int("poisson", -1, "The average number of microseconds between requests. -1 disables Poisson.")
+var percentWrites = flag.Float64("writes", 1, "A float between 0 and 1 that corresponds to the percentage of requests that should be writes. The remainder will be reads.")
+var blindWrites = flag.Bool("blindwrites", false, "True if writes don't need to execute before clients receive responses.")
 
-var N int
+// Information about the latency of an operation
+type response struct {
+	receivedAt    time.Time
+	rtt           float64 // The operation latency, in ms
+	commitLatency float64 // The operation's commit latency, in ms
+}
 
-var successful []int
+// Information pertaining to operations that have been issued but that have not
+// yet received responses
+type outstandingRequestInfo struct {
+	sync.Mutex
+	sema       *semaphore.Weighted // Controls number of outstanding operations
+	startTimes map[int32]time.Time // The time at which operations were sent out
+}
 
-var rarray []int
-var rsp []bool
+// An outstandingRequestInfo per client thread
+var orInfos []*outstandingRequestInfo
 
 func main() {
 	flag.Parse()
 
 	runtime.GOMAXPROCS(*procs)
 
-	randObj := rand.New(rand.NewSource(42))
-	zipf := rand.NewZipf(randObj, *s, *v, uint64(*reqsNb / *rounds + *eps))
-
 	if *conflicts > 100 {
 		log.Fatalf("Conflicts percentage must be between 0 and 100.\n")
 	}
 
-	master, err := rpc.DialHTTP("tcp", fmt.Sprintf("%s:%d", *masterAddr, *masterPort))
-	if err != nil {
-		log.Fatalf("Error connecting to master\n")
+	orInfos = make([]*outstandingRequestInfo, *T)
+
+	var master *rpc.Client
+	var err error
+	for {
+		master, err = rpc.DialHTTP("tcp", fmt.Sprintf("%s:%d", *masterAddr, *masterPort))
+		if err != nil {
+			log.Println("Error connecting to master", err)
+		} else {
+			break
+		}
 	}
 
 	rlReply := new(masterproto.GetReplicaListReply)
-	err = master.Call("Master.GetReplicaList", new(masterproto.GetReplicaListArgs), rlReply)
-	if err != nil {
-		log.Fatalf("Error making the GetReplicaList RPC")
-	}
-
-	N = len(rlReply.ReplicaList)
-	servers := make([]net.Conn, N)
-	readers := make([]*bufio.Reader, N)
-	writers := make([]*bufio.Writer, N)
-
-	rarray = make([]int, *reqsNb / *rounds + *eps)
-	karray := make([]int64, *reqsNb / *rounds + *eps)
-	put := make([]bool, *reqsNb / *rounds + *eps)
-	perReplicaCount := make([]int, N)
-	test := make([]int, *reqsNb / *rounds + *eps)
-	for i := 0; i < len(rarray); i++ {
-		r := rand.Intn(N)
-		rarray[i] = r
-		if i < *reqsNb / *rounds {
-			perReplicaCount[r]++
-		}
-
-		if *conflicts >= 0 {
-			r = rand.Intn(100)
-			if r < *conflicts {
-				karray[i] = 42
-			} else {
-				karray[i] = int64(43 + i)
-			}
-			r = rand.Intn(100)
-			if r < *writes {
-				put[i] = true
-			} else {
-				put[i] = false
-			}
-		} else {
-			karray[i] = int64(zipf.Uint64())
-			test[karray[i]]++
-		}
-	}
-	if *conflicts >= 0 {
-		fmt.Println("Uniform distribution")
-	} else {
-		fmt.Println("Zipfian distribution:")
-		//fmt.Println(test[0:100])
-	}
-
-	for i := 0; i < N; i++ {
-		var err error
-		servers[i], err = net.Dial("tcp", rlReply.ReplicaList[i])
+	for !rlReply.Ready {
+		err := master.Call("Master.GetReplicaList", new(masterproto.GetReplicaListArgs), rlReply)
 		if err != nil {
-			log.Printf("Error connecting to replica %d\n", i)
+			log.Println("Error making the GetReplicaList RPC", err)
 		}
-		readers[i] = bufio.NewReader(servers[i])
-		writers[i] = bufio.NewWriter(servers[i])
 	}
 
-	successful = make([]int, N)
 	leader := 0
-
-	if *noLeader == false {
+	if *forceLeader < 0 {
 		reply := new(masterproto.GetLeaderReply)
 		if err = master.Call("Master.GetLeader", new(masterproto.GetLeaderArgs), reply); err != nil {
-			log.Fatalf("Error making the GetLeader RPC\n")
+			log.Println("Error making the GetLeader RPC:", err)
 		}
 		leader = reply.LeaderId
-		log.Printf("The leader is replica %d\n", leader)
+	} else {
+		leader = *forceLeader
 	}
+	log.Printf("The leader is replica %d\n", leader)
 
-	var id int32 = 0
-	done := make(chan bool, N)
-	args := genericsmrproto.Propose{id, state.Command{state.PUT, 0, 0}, 0}
+	readings := make(chan *response, 100000)
 
-	before_total := time.Now()
+	for i := 0; i < *T; i++ {
+		server, err := net.Dial("tcp", rlReply.ReplicaList[leader])
+		if err != nil {
+			log.Fatalf("Error connecting to replica %d\n", leader)
+		}
+		reader := bufio.NewReader(server)
+		writer := bufio.NewWriter(server)
 
-	for j := 0; j < *rounds; j++ {
-
-		n := *reqsNb / *rounds
-
-		if *check {
-			rsp = make([]bool, n)
-			for j := 0; j < n; j++ {
-				rsp[j] = false
-			}
+		orInfo := &outstandingRequestInfo{
+			sync.Mutex{},
+			semaphore.NewWeighted(*outstandingReqs),
+			make(map[int32]time.Time, *outstandingReqs),
 		}
 
-		if *noLeader {
-			for i := 0; i < N; i++ {
-				go waitReplies(readers, i, perReplicaCount[i], done)
+		go simulatedClientWriter(writer, orInfo)
+		go simulatedClientReader(reader, orInfo, readings)
+
+		orInfos[i] = orInfo
+	}
+
+	printer(readings)
+}
+
+func simulatedClientWriter(writer *bufio.Writer, orInfo *outstandingRequestInfo) {
+	args := genericsmrproto.Propose{0 /* id */, state.Command{state.PUT, 0, 0}, 0 /* timestamp */}
+
+	conflictRand := rand.New(rand.NewSource(time.Now().UnixNano()))
+	zipf := zipfian.NewZipfianGenerator(*zKeys, *theta)
+	poissonGenerator := poisson.NewPoisson(*poissonAvg)
+	opRand := rand.New(rand.NewSource(time.Now().UnixNano()))
+
+	queuedReqs := 0 // The number of poisson departures that have been missed
+
+	for id := int32(0); ; id++ {
+		args.CommandId = id
+
+		// Determine key
+		if *conflicts >= 0 {
+			r := conflictRand.Intn(100)
+			if r < *conflicts {
+				args.Command.K = 42
+			} else {
+				args.Command.K = state.Key(*startRange + 43 + int(id))
 			}
 		} else {
-			go waitReplies(readers, leader, n, done)
+			args.Command.K = state.Key(zipf.NextNumber())
+		}
+
+		// Determine operation type
+		if *percentWrites > opRand.Float64() {
+			if !*blindWrites {
+				args.Command.Op = state.PUT // write operation
+			} else {
+				args.Command.Op = state.PUT_BLIND
+			}
+		} else {
+			args.Command.Op = state.GET // read operation
+		}
+
+		if *poissonAvg == -1 { // Poisson disabled
+			orInfo.sema.Acquire(context.Background(), 1)
+		} else {
+			for {
+				if orInfo.sema.TryAcquire(1) {
+					if queuedReqs == 0 {
+						time.Sleep(poissonGenerator.NextArrival())
+					} else {
+						queuedReqs -= 1
+					}
+					break
+				}
+				time.Sleep(poissonGenerator.NextArrival())
+				queuedReqs += 1
+			}
 		}
 
 		before := time.Now()
+		writer.WriteByte(genericsmrproto.PROPOSE)
+		args.Marshal(writer)
+		writer.Flush()
 
-		for i := 0; i < n+*eps; i++ {
-			dlog.Printf("Sending proposal %d\n", id)
-			args.CommandId = id
-			if put[i] {
-				args.Command.Op = state.PUT
-			} else {
-				args.Command.Op = state.GET
-			}
-			args.Command.K = state.Key(karray[i])
-			args.Command.V = state.Value(i)
-			//args.Timestamp = time.Now().UnixNano()
-			if !*fast {
-				if *noLeader {
-					leader = rarray[i]
-				}
-				writers[leader].WriteByte(genericsmrproto.PROPOSE)
-				args.Marshal(writers[leader])
-			} else {
-				//send to everyone
-				for rep := 0; rep < N; rep++ {
-					writers[rep].WriteByte(genericsmrproto.PROPOSE)
-					args.Marshal(writers[rep])
-					writers[rep].Flush()
-				}
-			}
-			//fmt.Println("Sent", id)
-			id++
-			if i%100 == 0 {
-				for i := 0; i < N; i++ {
-					writers[i].Flush()
-				}
-			}
-		}
-		for i := 0; i < N; i++ {
-			writers[i].Flush()
-		}
-
-		err := false
-		if *noLeader {
-			for i := 0; i < N; i++ {
-				e := <-done
-				err = e || err
-			}
-		} else {
-			err = <-done
-		}
-
-		after := time.Now()
-
-		fmt.Printf("Round took %v\n", after.Sub(before))
-
-		if *check {
-			for j := 0; j < n; j++ {
-				if !rsp[j] {
-					fmt.Println("Didn't receive", j)
-				}
-			}
-		}
-
-		if err {
-			if *noLeader {
-				N = N - 1
-			} else {
-				reply := new(masterproto.GetLeaderReply)
-				master.Call("Master.GetLeader", new(masterproto.GetLeaderArgs), reply)
-				leader = reply.LeaderId
-				log.Printf("New leader is replica %d\n", leader)
-			}
-		}
+		orInfo.Lock()
+		orInfo.startTimes[id] = before
+		orInfo.Unlock()
 	}
-
-	after_total := time.Now()
-	fmt.Printf("Test took %v\n", after_total.Sub(before_total))
-
-	s := 0
-	for _, succ := range successful {
-		s += succ
-	}
-
-	fmt.Printf("Successful: %d\n", s)
-
-	for _, client := range servers {
-		if client != nil {
-			client.Close()
-		}
-	}
-	master.Close()
 }
 
-func waitReplies(readers []*bufio.Reader, leader int, n int, done chan bool) {
-	e := false
+func simulatedClientReader(reader *bufio.Reader, orInfo *outstandingRequestInfo, readings chan *response) {
+	var reply genericsmrproto.ProposeReply
 
-	reply := new(genericsmrproto.ProposeReplyTS)
-	for i := 0; i < n; i++ {
-		if err := reply.Unmarshal(readers[leader]); err != nil {
-			fmt.Println("Error when reading:", err)
-			e = true
-			continue
+	for {
+		if err := reply.Unmarshal(reader); err != nil || reply.OK == 0 {
+			log.Println("Error when reading:", err)
+			break
 		}
-		//fmt.Println(reply.Value)
-		if *check {
-			if rsp[reply.CommandId] {
-				fmt.Println("Duplicate reply", reply.CommandId)
-			}
-			rsp[reply.CommandId] = true
-		}
-		if reply.OK != 0 {
-			successful[leader]++
+		after := time.Now()
+
+		orInfo.sema.Release(1)
+
+		orInfo.Lock()
+		before := orInfo.startTimes[reply.CommandId]
+		delete(orInfo.startTimes, reply.CommandId)
+		orInfo.Unlock()
+
+		rtt := (after.Sub(before)).Seconds() * 1000
+		commitToExec := float64(reply.Timestamp) / 1e6
+		commitLatency := rtt - commitToExec
+
+		readings <- &response{
+			after,
+			rtt,
+			commitLatency,
 		}
 	}
-	done <- e
+}
+
+func printer(readings chan *response) {
+	lattputFile, err := os.Create("lattput.txt")
+	if err != nil {
+		log.Println("Error creating lattput file", err)
+		return
+	}
+	lattputFile.WriteString("# time (ns), avg lat over the past second, tput since last line, total count, totalOrs, avg commit lat over the past second,.\n")
+
+	latFile, err := os.Create("latency.txt")
+	if err != nil {
+		log.Println("Error creating latency file", err)
+		return
+	}
+	latFile.WriteString("# time (ns), latency, commit latency.\n")
+
+	startTime := time.Now()
+
+	for {
+		time.Sleep(time.Second)
+
+		count := len(readings)
+		var sum float64 = 0
+		var commitSum float64 = 0
+		endTime := time.Now() // Set to current time in case there are no readings
+		for i := 0; i < count; i++ {
+			resp := <-readings
+
+			// Log all to latency file
+			latFile.WriteString(fmt.Sprintf("%d %f %f\n", resp.receivedAt.UnixNano(), resp.rtt, resp.commitLatency))
+			sum += resp.rtt
+			commitSum += resp.commitLatency
+			endTime = resp.receivedAt
+		}
+
+		var avg float64
+		var avgCommit float64
+		var tput float64
+		if count > 0 {
+			avg = sum / float64(count)
+			avgCommit = commitSum / float64(count)
+			tput = float64(count) / endTime.Sub(startTime).Seconds()
+		}
+
+		totalOrs := 0
+		for i := 0; i < *T; i++ {
+			orInfos[i].Lock()
+			totalOrs += len(orInfos[i].startTimes)
+			orInfos[i].Unlock()
+		}
+
+		// Log summary to lattput file
+		lattputFile.WriteString(fmt.Sprintf("%d %f %f %d %d %f\n", endTime.UnixNano(),
+			avg, tput, count, totalOrs, avgCommit))
+
+		startTime = endTime
+	}
 }

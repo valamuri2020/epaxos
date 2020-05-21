@@ -9,22 +9,27 @@ import (
 	"net"
 	"net/http"
 	"net/rpc"
+	"strings"
 	"sync"
 	"time"
 )
 
 var portnum *int = flag.Int("port", 7087, "Port # to listen on. Defaults to 7087")
 var numNodes *int = flag.Int("N", 3, "Number of replicas. Defaults to 3.")
+var nodeIPs *string = flag.String("ips", "", "Space separated list of IP addresses (ordered). The leader will be 0")
 
 type Master struct {
-	N        int
-	nodeList []string
-	addrList []string
-	portList []int
-	lock     *sync.Mutex
-	nodes    []*rpc.Client
-	leader   []bool
-	alive    []bool
+	N              int
+	nodeList       []string
+	addrList       []string
+	portList       []int
+	lock           *sync.Mutex
+	nodes          []*rpc.Client
+	leader         []bool
+	alive          []bool
+	expectAddrList []string
+	connected      []bool
+	nConnected     int
 }
 
 func main() {
@@ -33,14 +38,25 @@ func main() {
 	log.Printf("Master starting on port %d\n", *portnum)
 	log.Printf("...waiting for %d replicas\n", *numNodes)
 
-	master := &Master{*numNodes,
-		make([]string, 0, *numNodes),
-		make([]string, 0, *numNodes),
-		make([]int, 0, *numNodes),
+	ips := []string{}
+	if *nodeIPs != "" {
+		ips = strings.Split(*nodeIPs, ",")
+		log.Println("Ordered replica ips:", ips, len(ips))
+	}
+
+	master := &Master{
+		*numNodes,
+		make([]string, *numNodes),
+		make([]string, *numNodes),
+		make([]int, *numNodes),
 		new(sync.Mutex),
 		make([]*rpc.Client, *numNodes),
 		make([]bool, *numNodes),
-		make([]bool, *numNodes)}
+		make([]bool, *numNodes),
+		ips,
+		make([]bool, *numNodes),
+		0,
+	}
 
 	rpc.Register(master)
 	rpc.HandleHTTP()
@@ -57,7 +73,7 @@ func main() {
 func (master *Master) run() {
 	for true {
 		master.lock.Lock()
-		if len(master.nodeList) == master.N {
+		if master.nConnected == master.N {
 			master.lock.Unlock()
 			break
 		}
@@ -72,7 +88,7 @@ func (master *Master) run() {
 		addr := fmt.Sprintf("%s:%d", master.addrList[i], master.portList[i]+1000)
 		master.nodes[i], err = rpc.DialHTTP("tcp", addr)
 		if err != nil {
-			log.Fatalf("Error connecting to replica %d\n", i)
+			log.Fatalf("Error connecting to replica %d: %v\n", i, err)
 		}
 		master.leader[i] = false
 	}
@@ -112,35 +128,52 @@ func (master *Master) run() {
 }
 
 func (master *Master) Register(args *masterproto.RegisterArgs, reply *masterproto.RegisterReply) error {
-
 	master.lock.Lock()
 	defer master.lock.Unlock()
 
-	nlen := len(master.nodeList)
-	index := nlen
-
 	addrPort := fmt.Sprintf("%s:%d", args.Addr, args.Port)
 
-	for i, ap := range master.nodeList {
-		if addrPort == ap {
-			index = i
+	i := master.N + 1
+
+	log.Println("Received Register", addrPort, master.nodeList)
+
+	for index, ap := range master.nodeList {
+		if ap == addrPort {
+			i = index
 			break
 		}
 	}
 
-	if index == nlen {
-		master.nodeList = master.nodeList[0 : nlen+1]
-		master.nodeList[nlen] = addrPort
-		master.addrList = master.addrList[0 : nlen+1]
-		master.addrList[nlen] = args.Addr
-		master.portList = master.portList[0 : nlen+1]
-		master.portList[nlen] = args.Port
-		nlen++
+	if i == master.N+1 {
+		for index, a := range master.expectAddrList {
+			if args.Addr == a {
+				i = index
+				if !master.connected[i] {
+					break
+				}
+			}
+		}
 	}
 
-	if nlen == master.N {
+	if i == master.N+1 {
+		log.Println("Received register from bad IP:", addrPort)
+		return nil
+	}
+
+	log.Println("Ended up with index", i)
+
+	if !master.connected[i] {
+		master.nodeList[i] = addrPort
+		master.addrList[i] = args.Addr
+		master.portList[i] = args.Port
+		master.connected[i] = true
+		master.nConnected++
+	}
+
+	if master.nConnected == master.N {
+		log.Println("All connected!")
 		reply.Ready = true
-		reply.ReplicaId = index
+		reply.ReplicaId = i
 		reply.NodeList = master.nodeList
 	} else {
 		reply.Ready = false
@@ -164,7 +197,7 @@ func (master *Master) GetReplicaList(args *masterproto.GetReplicaListArgs, reply
 	master.lock.Lock()
 	defer master.lock.Unlock()
 
-	if len(master.nodeList) == master.N {
+	if master.nConnected == master.N {
 		reply.ReplicaList = master.nodeList
 		reply.Ready = true
 	} else {
