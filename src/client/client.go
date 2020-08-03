@@ -219,14 +219,14 @@ func printer(readings chan *response) {
 		log.Println("Error creating lattput file", err)
 		return
 	}
-	lattputFile.WriteString("# time (ns), avg lat over the past second, tput since last line, total count, totalOrs, avg commit lat over the past second,.\n")
+	lattputFile.WriteString("# time (ns), avg lat over the past second, tput since last line, total count, totalOrs, avg commit lat over the past second\n")
 
 	latFile, err := os.Create("latency.txt")
 	if err != nil {
 		log.Println("Error creating latency file", err)
 		return
 	}
-	latFile.WriteString("# time (ns), latency, commit latency.\n")
+	latFile.WriteString("# time (ns), latency, commit latency\n")
 
 	startTime := time.Now()
 

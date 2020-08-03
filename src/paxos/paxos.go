@@ -237,6 +237,13 @@ func (r *Replica) run() {
 			//got an Accept reply
 			r.handleAcceptReply(acceptReply)
 			break
+
+		case metricsRequest := <-r.MetricsChan:
+			// Empty reply because there are no relevant metrics
+			reply := &genericsmrproto.MetricsReply{}
+			reply.Marshal(metricsRequest.Reply)
+			metricsRequest.Reply.Flush()
+			break
 		}
 	}
 }
