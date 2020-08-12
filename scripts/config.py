@@ -15,19 +15,67 @@
 # OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
 
 """
-This file contains user-specific constants. These should be updated when the
-repo is cloned before running the scripts.
+This file contains user-specific constants and functions. These should be
+updated when the repo is cloned before running the scripts.
 """
 
 """
 This constant should be set to be the ID of the Google Cloud Compute Engine
 project that you want to use to run the experiments.
 """
-GCLOUD_PROJECT_ID = pass
+GCLOUD_PROJECT_ID = "TODO"
 
 """
 This constant should be set to the expanded path of the directory of the cloned
 epaxos repo. (This will likely be one directory up from the directory containing
 this file.)
 """
-EPAXOS_DIR = pass
+EPAXOS_DIR = "TODO"
+
+def download_clock_sync_software(instance):
+    """
+    Given an GCloudInstance object, downloads (or copies from the local machine)
+    the necessary software to that instance so that it can synchronize its
+    clocks with other machines. Expected to be asynchronous and return a
+    function handler that will wait for the process to complete when called.
+    """
+    # TODO: return utils.execute(command, desc)
+    pass
+
+def install_clock_sync_software(instance):
+    """
+    Given a GCloudInstance object that already has the clock synchronization
+    software downloaded, installs that software. Expected to be asynchronous and
+    return a function handler that will wait for the process to complete when
+    called.
+    """
+    # TODO: return utils.execute(command, desc)
+    pass
+
+def reset_clock_sync(instance):
+    """
+    Given an instance (server or master), kills any clock synchronization
+    software and removes and reminants of the software, such that it will run
+    cleanly on the next attempt. Expected to be asynchronous and return a
+    function handler that will wait for the process to complete when called.
+    """
+    # TODO: return utils.execute(command, desc)
+    pass
+
+def synchronize_clocks_master(master):
+    """
+    Given a GCloudMaster object, runs the clock synchronization master software.
+    Expected to be asynchronous and non-blocking.
+    """
+    # TODO: return utils.execute(command, desc)
+    pass
+
+def synchronize_clocks_server(server, master_ip):
+    """
+    Given a GCloudServer object and the string IP address of the GCloudMaster
+    for the topology, which will be running its clock synchronization software,
+    runs the clock synchronization software for a server. Expected to be
+    asynchronous and non-blocking.
+    """
+    # TODO: return utils.execute(command, desc)
+    pass
