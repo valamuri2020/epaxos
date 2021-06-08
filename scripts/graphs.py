@@ -23,8 +23,11 @@ from matplotlib import lines, patches, ticker
 import matplotlib.pyplot as plt
 import numpy as np
 from os import path
+import statistics
+from tabulate import tabulate
 
-from experiment import Experiment
+from experiment import Experiment, CLOCK_SYNC_NONE, CLOCK_SYNC_QUORUM, \
+    CLOCK_SYNC_QUORUM_UNION, CLOCK_SYNC_CLUSTER
 from results import Results
 import utils
 
@@ -33,7 +36,7 @@ ORDERED_LOCS = ['va', 'ca', 'or', 'jp', 'eu']
 # A color to use when differentiating from the default EPaxos Zipfian experiment
 ALTERNATE_ZIPF_COLOR = '#DA70D6' # Light purple
 # Fill patterns in a consistent order
-HATCHES = [None, '//', '.']
+HATCHES = [None, '//', None]# TODO: revert!! '.']
 
 # Set a consistent font for all graphs
 matplotlib.rc('font',**{'family':'sans-serif','sans-serif':['Helvetica']})
@@ -65,7 +68,7 @@ def get_fixed_epaxos_result(results, perc_conflict):
     EPaxos and the workload fixed at the percentage provided by 'perc_conflict'.
     """
     return list(filter(lambda r: is_fixed_epaxos_result(r, perc_conflict),
-        results))[0]
+        results))
 
 def is_epaxos_zipf_result(r):
     """
@@ -80,14 +83,14 @@ def get_epaxos_zipf_result(results):
     Returns a Results object from the 'results' list in which the protocol was
     EPaxos and the workload was Zipfian.
     """
-    return list(filter(is_epaxos_zipf_result, results))[0]
+    return list(filter(is_epaxos_zipf_result, results))
 
 def get_mpaxos_result(results):
     """
     Returns a Results object from the 'results' list in which the protocol was
     Multi-Paxos.
     """
-    return list(filter(lambda r: r.is_mpaxos(), results))[0]
+    return list(filter(lambda r: r.is_mpaxos(), results))
 
 def legend_line(color, linestyle='-'):
     """
@@ -119,7 +122,8 @@ def get_color(result):
     These colors associate with those used in the original EPaxos evaluation for
     easy comparison.
     """
-    if result.batching_enabled(): return ALTERNATE_ZIPF_COLOR
+    if result.batching_enabled() or result.thrifty():
+        return ALTERNATE_ZIPF_COLOR
     if result.is_mpaxos(): return '#0085fa' # Blue
     if is_fixed_epaxos_result(result, 0): return '#FFD700' # Yellow
     if is_fixed_epaxos_result(result, 2): return '#FF7F00' # Orange
@@ -163,7 +167,7 @@ def format_cdf(ax):
             return s + '%'
     ax.yaxis.set_major_formatter(ticker.FuncFormatter(to_percent))
 
-def make_legend(ax, handles, labels, ncol, loc, size=20, squeeze=False):
+def make_legend(ax, handles, labels, ncol, loc, size=20, squeeze=False, bbox_to_anchor=None):
     """
     Plots and returns a legend on the Axes 'ax'. 'handles' contains the swatches
     for the legend, and 'labels' contains the text to associate with each
@@ -176,11 +180,12 @@ def make_legend(ax, handles, labels, ncol, loc, size=20, squeeze=False):
     return ax.legend(handles, labels, facecolor='white',  ncol=ncol, loc=loc,
         columnspacing=1, prop={'size': size},
         borderaxespad=.1 if squeeze else .3, borderpad=.3 if squeeze else .5,
-        handletextpad=.5)
+        handletextpad=.5, bbox_to_anchor=bbox_to_anchor)
 
-def plot_bar_by_loc(ax, expts, yfn, errorfn, colorfn, annotatefn, barwidth,
-    fontsize, maxy, ystep, annotationsize=11, annotationheight=10,
-    annotationhadjust=None, xlabelhadjust=.1):
+def plot_bar_by_loc(ax, expts, yfn, errfn, colorfn, annotatefn, barwidth,
+    fontsize, maxy, ystep, annotationsize=11, locs=ORDERED_LOCS,
+    hatches=[None, '//', None], hatch_fill=[0, 1], annotationangle=45,
+    errwidth=10, actual_barwidth=None):
     """
     Plots a bar graph on the Axes 'ax'. The bar graph is the same format as
     Figure 4 from the original EPaxos paper; for each location, the results
@@ -205,45 +210,62 @@ def plot_bar_by_loc(ax, expts, yfn, errorfn, colorfn, annotatefn, barwidth,
     the horizontal direction. 'xlabelhadjust' refers to the amount the location
     labels should be moved left of center in order for them to appear centered.
     """
-    xpos = np.arange(len(ORDERED_LOCS))
+    xpos = np.arange(len(locs))
 
-    for loci, loc in enumerate(ORDERED_LOCS):
+    if not actual_barwidth: actual_barwidth = barwidth
+
+    for loci, loc in enumerate(locs):
+        maxerr = 0
+
         for expti, expt in enumerate(expts):
             x = xpos[loci] + expti*barwidth
 
             ys = yfn(expt, loc)
-            error = 0
+            errs = errfn(expt, loc) if errfn is not None else [None for _ in ys]
 
             # Plot each y value in ascending order. The first will be solidly
             # filled, and the remaining will be white with different hatch
             # fillings.
             for yi, y in enumerate(ys):
-                color = colorfn(expt) if yi == 0 else 'white'
-                edgecolor = 'black' if yi == 0 else colorfn(expt)
-                yerr = None
-                if yi == len(ys) - 1 and errorfn is not None:
-                    error = errorfn(expt, loc)-y
-                    yerr = [[0], [error]]
-                rect = ax.bar(x, y, barwidth, color=color, edgecolor=edgecolor,
-                    hatch=HATCHES[yi], zorder=10-yi, yerr=yerr, capsize=10)
+                color = colorfn(expt) if yi in hatch_fill else 'white'
+                edgecolor = 'black' if yi in hatch_fill else colorfn(expt)
 
-            # Add annotation above the topmost bar if appropriate
+                yerr = errs[yi]
+                if yerr is not None:
+                    err_min, err_max = yerr
+                    yerr = [[y-err_min], [err_max-y]]
+                    if yi != len(ys)-1: lower = err_max
+                    maxerr = max(maxerr, err_max)
+                rect = ax.bar(x, y, actual_barwidth, color=color, edgecolor=edgecolor,
+                    hatch=hatches[yi], zorder=10-yi, yerr=yerr, capsize=errwidth)
+
+        for expti, expt in enumerate(expts):
+            # Add annotation at the bottom of the bar if appropriate
             if annotatefn is not None:
                 annotation = annotatefn(expt, loc)
                 if annotation is not None:
-                    x = rect[0].get_x()+rect[0].get_width()/2.
-                    if annotationhadjust is not None:
-                        x += annotationhadjust(expti)
-                    y = rect[0].get_height()+error+annotationheight
-                    ax.text(x, y, annotation, ha='center',
-                        va='bottom', size=annotationsize, zorder=10)
+                    # x = rect[0].get_x()+rect[0].get_width()/2.
+                    # y = rect[0].get_y()+lower+(err_min-lower)/2 # adjustment
+                    # ax.text(x, y, annotation, ha='center',
+                    #     va='center', size=annotationsize, zorder=10, color='black', rotation=270)
+                    # x = rect[0].get_x()+rect[0].get_width()/2.
+                    x = xpos[loci] + expti*barwidth - barwidth/4.
+                    y = maxerr + 4 # adjustment
+                    # ax.text(x, y, annotation, ha='left', bbox=dict(facecolor='white', edgecolor=colorfn(expt), boxstyle='round'),
+                    #     va='bottom', size=annotationsize, zorder=10, color='black', rotation=45)
+                    ax.text(x, y, annotation, ha='left', bbox=dict(facecolor='white', edgecolor='white', pad=0),
+                        va='bottom', size=annotationsize+4, zorder=4, color=colorfn(expt), rotation=annotationangle)
 
     # Add labels for locations on the x axis and set font size for y axis
     # labels.
-    ax.set_xticks(xpos+barwidth*len(expts)/2-xlabelhadjust)
-    ax.set_xticklabels([l.upper() for l in ORDERED_LOCS], fontsize=fontsize)
-    ax.tick_params(axis='y', labelsize=fontsize)
+
+    if len(locs) > 1:
+        ax.set_xticks(xpos+barwidth*len(expts)/2.-barwidth/2.)
+        ax.set_xticklabels([l.upper() for l in locs], fontsize=fontsize, ha='center')
+    else: ax.set_xticklabels('')
     ax.tick_params(axis='x', length=0)
+    ax.tick_params(axis='y', labelsize=fontsize)
+
 
     # Add horizontal lines at specified y intervals.
     ax.set_ylim(0, maxy)
@@ -251,13 +273,15 @@ def plot_bar_by_loc(ax, expts, yfn, errorfn, colorfn, annotatefn, barwidth,
     ax.set_yticks(ys)
     for y in ys[1:-1]:
         ax.axhline(y=y, color='gray', linestyle='dotted', zorder=1)
+    if ys[-1] != maxy:
+        ax.axhline(y=ys[-1], color='gray', linestyle='dotted', zorder=1)
 
 def conflict_annotation(expt, loc):
     """
     Returns conflict rate of an experiment as a string percentage. Only does
     this if the experiment is EPaxos, as MPaxos has no conflict rate.
     """
-    if expt.is_epaxos():
+    if expt.is_epaxos() and not is_fixed_epaxos_result(expt, 0):
         conflict_rate = '{}%'.format(round(expt.conflict_rate(loc)*100, 1))
         return conflict_rate
 
@@ -283,19 +307,44 @@ def reproduction_bar(dirname):
 
     fig, axs = plt.subplots(2, 1, figsize=(13, 6), constrained_layout=True)
     barwidth = .18
-    fontsize = 20
+    fontsize = 16
     maxy = 400
     ystep = 100
 
+    color_fn = lambda expts: get_color(expts[0])
+
     # Plot mean commit latency vs. mean execution latency on the top graph
-    plot_bar_by_loc(axs[0], expts, lambda expt, loc: (expt.mean_lat_commit(loc),
-        expt.mean_lat_exec(loc)), None, get_color, conflict_annotation,
-        barwidth, fontsize, maxy, ystep)
+    plot_bar_by_loc(axs[0], expts, lambda expts, loc: ([statistics.mean([expt.mean_lat_commit(loc) for expt in expts]),
+        statistics.mean([expt.mean_lat_exec(loc) for expt in expts])]),
+        lambda expts, loc: [(min([expt.mean_lat_commit(loc) for expt in expts]),
+            max([expt.mean_lat_commit(loc) for expt in expts])), (min([expt.mean_lat_exec(loc) for expt in expts]),
+            max([expt.mean_lat_exec(loc) for expt in expts]))],
+        color_fn, None,#conflict_range_annotation,
+        barwidth, fontsize, maxy, ystep,
+        hatches=[None, '//'], hatch_fill=[0], errwidth=6)
     # Plot 99th percentile commit latency vs. 99th percentile execution latency
     # on the bottom graph
-    plot_bar_by_loc(axs[1], expts, lambda expt, loc: (expt.p99_lat_commit(loc),
-        expt.p99_lat_exec(loc)), None, get_color, conflict_annotation, barwidth,
-        fontsize, maxy, ystep)
+    plot_bar_by_loc(axs[1], expts, lambda expts, loc: ([statistics.mean([expt.p99_lat_commit(loc) for expt in expts]),
+        statistics.mean([expt.p99_lat_exec(loc) for expt in expts])]),
+        lambda expts, loc: [(min([expt.p99_lat_commit(loc) for expt in expts]),
+            max([expt.p99_lat_commit(loc) for expt in expts])), (min([expt.p99_lat_exec(loc) for expt in expts]),
+            max([expt.p99_lat_exec(loc) for expt in expts]))],
+        color_fn, conflict_range_annotation, barwidth,
+        fontsize, maxy, ystep,
+        hatches=[None, '//'], hatch_fill=[0], annotationangle=27, errwidth=6)
+
+    axs[1].annotate('Conflict Rate', xy=(.34, 340), xytext=(.19, 340),
+        fontsize=14, arrowprops=dict(facecolor='black', arrowstyle='-|>'),
+        verticalalignment='center', horizontalalignment='right')
+    # axs[1].annotate('Conflict Rate', xy=(.17, 280), xytext=(.2, 230),
+    #     fontsize=14, arrowprops=dict(facecolor='black', arrowstyle='-|>'),
+    #     verticalalignment='center', horizontalalignment='right')
+    # axs[1].annotate(' ', xy=(1.6, 290), xytext=(1.75, 275),
+    #     fontsize=14, arrowprops=dict(facecolor='black', arrowstyle='-|>'),
+    #     verticalalignment='top')
+    # axs[1].annotate('Conflict Rate', xy=(2.15, 290), xytext=(2.11, 250),
+    #     fontsize=14, arrowprops=dict(facecolor='black', arrowstyle='-|>'),
+    #     verticalalignment='center', horizontalalignment='right')
 
     axs[0].set_ylabel('Mean Latency (ms)', fontsize=fontsize)
     axs[1].set_ylabel('P99 Latency (ms)', fontsize=fontsize)
@@ -303,10 +352,10 @@ def reproduction_bar(dirname):
     # Add two legends to the top graph: on the left, the legend tells us which
     # colors refer to which experiments. On the right, the legend tells us
     # which fill patterns refer to commit and execution latency.
-    leg = make_legend(axs[0], [legend_patch_color(get_color(e)) for e in expts],
-        [e.description() for e in expts], ncol=5, loc='upper left')
+    leg = make_legend(axs[0], [legend_patch_color(color_fn(e)) for e in expts],
+        [e[0].description() for e in expts], ncol=5, loc='upper left', size=fontsize)
     make_legend(axs[0], [legend_patch_hatch(HATCHES[i]) for i in range(2)],
-        ['Commit', 'Exec'], ncol=2, loc='upper right')
+        ['Commit', 'Exec'], ncol=2, loc='upper right', size=fontsize)
     axs[0].add_artist(leg)
 
     plt.savefig(path.join(dirname, 'reproduction_bar.pdf'))
@@ -322,9 +371,9 @@ def batching_bar(dirname):
 
     results = get_results(dirname)
     batching = list(filter(lambda r: r.is_epaxos() and r.batching_enabled(),
-        results))[0]
+        results))
     no_batching = list(filter(lambda r: r.is_epaxos() and not r.batching_enabled(),
-        results))[0]
+        results))
     mpaxos = get_mpaxos_result(results)
     expts = [batching, no_batching, mpaxos]
 
@@ -336,22 +385,414 @@ def batching_bar(dirname):
 
     # Plots mean latency as a bar and 99th percentile latency as an error bar
     # above it.
-    plot_bar_by_loc(ax, expts, lambda expt, loc: [expt.mean_lat_exec(loc)],
-        lambda expt, loc: expt.p99_lat_exec(loc), get_color,
-        conflict_annotation, barwidth, fontsize, maxy, ystep, annotationsize=20,
-        annotationheight=0.6,
+    plot_bar_by_loc(ax, expts, lambda expt, loc: [statistics.mean([e.mean_lat_exec(loc) for e in expt]),
+        statistics.mean([e.p99_lat_exec(loc) for e in expt])],
+        lambda expt, loc: [[min([e.mean_lat_exec(loc) for e in expt]), max([e.mean_lat_exec(loc) for e in expt])],
+        [min([e.p99_lat_exec(loc) for e in expt]), max([e.p99_lat_exec(loc) for e in expt])]],
+        lambda e: get_color(e[0]),
+        conflict_range_annotation, barwidth, fontsize, maxy, ystep, annotationsize=16,#20,
+        # annotationheight=0.6,
         # Move the conflict rate labels slightly to the left and right so that
         # they are easier to read and can be larger without overlapping.
-        annotationhadjust=lambda expti: (-0.05 if expti == 0 else .05),
-        xlabelhadjust=.12)
+        # annotationhadjust=lambda expti: (-0.05 if expti == 0 else .05),
+        # xlabelhadjust=.12
+        # extra_err_fn=lambda expt, loc: [min([e.p99_lat_exec(loc) for e in expt]), max([e.p99_lat_exec(loc) for e in expt])],
+        hatches=[None, None], hatch_fill=[0], annotationangle=27,
+        )
 
     ax.set_ylabel('Mean/P99 Latency (ms)', fontsize=fontsize)
 
-    make_legend(ax, [legend_patch_color(get_color(e)) for e in expts],
-        ['Batching', 'No Batching', mpaxos.description()], ncol=3,
-        loc='upper right', size=fontsize)
+    leg = make_legend(ax, [legend_patch_color(get_color(e[0])) for e in expts],
+        ['Batching', 'No Batching', mpaxos[0].description()], ncol=3,
+        loc='lower right', size=fontsize, squeeze=True)
+    leg.set_zorder(20)
 
     plt.savefig(path.join(dirname, 'batching_bar.pdf'))
+
+def base_latency(expt, loc):
+    if isinstance(expt, list): expt = expt[0]
+    if expt.is_epaxos():
+        if expt.clock_sync_str() in [CLOCK_SYNC_NONE, CLOCK_SYNC_QUORUM]:
+            return {
+                'ca': 64,
+                'va': 64,
+                'or': 59,
+                'jp': 98,
+                'eu': 129,
+            }[loc]
+        if expt.clock_sync_str() == CLOCK_SYNC_QUORUM_UNION:
+            return {
+                'ca': 64,
+                'va': 64,
+                'or': 59,
+                'jp': 98 + (73-49),
+                'eu': 129 + (68-64),
+            }[loc]
+        if expt.clock_sync_str() == CLOCK_SYNC_CLUSTER:
+            return {
+                'ca': 64 + (68-32),
+                'va': 64 + (73-32),
+                'or': 59 + (64-29),
+                'jp': 98 + (110-49),
+                'eu': 129 + (110-64),
+            }[loc]
+
+    if expt.is_mpaxos():
+        return {
+            'ca': 64,
+            'va': 128,
+            'or': 90,
+            'jp': 162,
+            'eu': 201,
+        }[loc]
+
+def osc_bar(dirname):
+    """
+    TODO(sktollman): add comment
+    """
+    plt.clf()
+
+    results = get_results(dirname)
+
+    workloads = [
+        (.8, .5),
+        (.99, 1),
+        # (.9, .5),
+    ]
+
+    fig, axs = plt.subplots(len(workloads), 1, figsize=(22, 10*len(workloads)), constrained_layout=True)
+    barwidth = .15
+    fontsize = 24
+    maxy = 400
+    ystep = 100
+
+    def color_fn(r):
+        if r[0].clock_sync_str() == CLOCK_SYNC_QUORUM:
+            return '#FF7F00'#FFD700'#'black'
+        if r[0].clock_sync_str() == CLOCK_SYNC_QUORUM_UNION:
+            return 'green'
+        if r[0].clock_sync_str() == CLOCK_SYNC_CLUSTER:
+            return 'red'
+
+        return get_color(r[0])
+
+    for i, (theta, writes) in enumerate(workloads):
+        ax = axs[i]
+
+        none = list(filter(lambda r: r.is_epaxos() and r.clock_sync_str() == CLOCK_SYNC_NONE and \
+            r.frac_writes() == writes and r.theta() == theta,
+            results))
+        quorum = list(filter(lambda r: r.is_epaxos() and r.clock_sync_str() == CLOCK_SYNC_QUORUM and \
+            r.frac_writes() == writes and r.theta() == theta,
+            results))
+        quorum_union = list(filter(lambda r: r.is_epaxos() and r.clock_sync_str() == CLOCK_SYNC_QUORUM_UNION and \
+            r.frac_writes() == writes and r.theta() == theta,
+            results))
+        cluster = list(filter(lambda r: r.is_epaxos() and r.clock_sync_str() == CLOCK_SYNC_CLUSTER and \
+            r.frac_writes() == writes and r.theta() == theta,
+            results))
+        mpaxos = get_mpaxos_result(results)
+        expts = [*[cluster, quorum_union, quorum, none][::-1], mpaxos]
+
+        # for loc in ORDERED_LOCS:
+        #     # mean_reg = statistics.mean([e.mean_lat_exec(loc) for e in none])
+        #     # dec = lambda x: round(100*(mean_reg-statistics.mean([e.mean_lat_exec(loc) for e in x]))/mean_reg,2)
+
+        #     conflict_reg = statistics.mean([e.conflict_rate(loc) for e in none])
+        #     dec = lambda x: '{}%'.format(round(100*(conflict_reg-statistics.mean([e.conflict_rate(loc) for e in x]))/conflict_reg,2))
+
+        #     print(theta, writes, loc, "Quorum dec:", dec(quorum))
+        #     print(theta, writes, loc, "Quorum union dec:", dec(quorum_union))
+
+        # conflict_reg = sum([statistics.mean([e.conflict_rate(loc) for e in none]) for loc in ORDERED_LOCS])
+        # dec = lambda x: '{}%'.format(round(100*(conflict_reg-sum([statistics.mean([e.conflict_rate(loc) for e in x]) for loc in ORDERED_LOCS]))/conflict_reg,2))
+
+        # print(theta, writes, "TOTAL Quorum dec:", dec(quorum))
+        # print(theta, writes, "TOTAL  Quorum union dec:", dec(quorum_union))
+
+        mean_reg = sum([statistics.mean([e.mean_lat_exec(loc) for e in none]) for loc in ORDERED_LOCS])
+        dec = lambda x: '{}%'.format(round(100*(mean_reg-sum([statistics.mean([e.mean_lat_exec(loc) for e in x]) for loc in ORDERED_LOCS]))/mean_reg,2))
+
+        print(theta, writes, "TOTAL Quorum dec:", dec(quorum))
+        print(theta, writes, "TOTAL  Quorum union dec:", dec(quorum_union))
+
+        # Plots mean latency as a bar and 99th percentile latency as an error bar
+        # above it.
+        plot_bar_by_loc(ax, expts, lambda expt, loc: [base_latency(expt[0], loc),
+            # expt.mean_lat_commit(loc),
+            statistics.mean([e.mean_lat_exec(loc) for e in expt]),
+            statistics.mean([e.p99_lat_exec(loc) for e in expt])],
+            # lambda expt, loc: expt.p99_lat_exec(loc),
+            lambda expt, loc: [None,
+                (min([e.mean_lat_exec(loc) for e in expt]), max([e.mean_lat_exec(loc) for e in expt])),
+                (min([e.p99_lat_exec(loc) for e in expt]), max([e.p99_lat_exec(loc) for e in expt]))
+            ],
+            color_fn,
+            conflict_range_annotation, barwidth, fontsize, maxy, ystep, annotationsize=20, annotationangle=40,
+            # Move the conflict rate labels slightly to the left and right so that
+            # they are easier to read and can be larger without overlapping.
+            # extra_err_fn=lambda expt, loc: (min([e.p99_lat_exec(loc) for e in expt]), max([e.p99_lat_exec(loc) for e in expt]))
+            )
+
+        ax.set_ylabel('Latency (ms)', fontsize=fontsize)
+        ax.set_title('Zipfian Skew (θ): {}\n% Writes: {}%'.format(theta, 100*writes), fontsize=fontsize)
+
+    leg = make_legend(axs[0], [legend_patch_color(color_fn(e)) for e in expts],
+        [*['All', 'Quorum Union', 'Quorum', 'No TOQ'][::-1], mpaxos[0].description()], ncol=6,
+        size=fontsize, loc='upper left')
+
+    # leg = make_legend(axs[0], [legend_patch_color(get_color(e)) for e in expts],
+    #     [e.description() for e in expts], ncol=5, loc='upper left')
+    make_legend(axs[0], [legend_patch_hatch(HATCHES[i]) for i in range(2)] +
+        [patches.Patch(edgecolor='black', facecolor='white')],
+        ['Minimum', 'Mean Exec', 'P99 Exec'], ncol=2, loc='upper right')
+    axs[0].add_artist(leg)
+
+    plt.savefig(path.join(dirname, 'osc_bar.pdf'))
+
+def osc_bar_loc(dirname):
+    """
+    TODO
+    """
+    loc = 'or'
+
+    plt.clf()
+
+    results = get_results(dirname)
+
+    workloads = [
+        # (.8, .5),
+        (.99, 1),
+        # (.9, .5),
+    ]
+
+    fig, ax = plt.subplots(1, len(workloads), figsize=(7, 15), constrained_layout=True)
+    barwidth = .15
+    fontsize = 32
+    maxy = 500
+    ystep = 100
+
+    def color_fn(r):
+        if r[0].clock_sync_str() == CLOCK_SYNC_QUORUM:
+            return '#FF7F00'#FFD700'#'black'
+        if r[0].clock_sync_str() == CLOCK_SYNC_QUORUM_UNION:
+            return 'green'
+        if r[0].clock_sync_str() == CLOCK_SYNC_CLUSTER:
+            return 'red'
+
+        return get_color(r[0])
+
+    for i, (theta, writes) in enumerate(workloads):
+        # ax = axs[i]
+
+        none = list(filter(lambda r: r.is_epaxos() and r.clock_sync_str() == CLOCK_SYNC_NONE and \
+            r.frac_writes() == writes and r.theta() == theta,
+            results))
+        quorum = list(filter(lambda r: r.is_epaxos() and r.clock_sync_str() == CLOCK_SYNC_QUORUM and \
+            r.frac_writes() == writes and r.theta() == theta,
+            results))
+        quorum_union = list(filter(lambda r: r.is_epaxos() and r.clock_sync_str() == CLOCK_SYNC_QUORUM_UNION and \
+            r.frac_writes() == writes and r.theta() == theta,
+            results))
+        cluster = list(filter(lambda r: r.is_epaxos() and r.clock_sync_str() == CLOCK_SYNC_CLUSTER and \
+            r.frac_writes() == writes and r.theta() == theta,
+            results))
+        mpaxos = get_mpaxos_result(results)
+        expts = [none, quorum, quorum_union, cluster, mpaxos]
+
+        # Plots mean latency as a bar and 99th percentile latency as an error bar
+        # above it.
+        plot_bar_by_loc(ax, expts, lambda expt, loc: [base_latency(expt[0], loc),
+            # expt.mean_lat_commit(loc),
+            statistics.mean([e.mean_lat_exec(loc) for e in expt]),
+            statistics.mean([e.p99_lat_exec(loc) for e in expt])],
+            # lambda expt, loc: expt.p99_lat_exec(loc),
+            lambda expt, loc: [None,
+                (min([e.mean_lat_exec(loc) for e in expt]), max([e.mean_lat_exec(loc) for e in expt])),
+                (min([e.p99_lat_exec(loc) for e in expt]), max([e.p99_lat_exec(loc) for e in expt]))
+            ],
+            color_fn,
+            conflict_range_annotation, barwidth, fontsize, maxy, ystep, annotationsize=28,
+            locs=['or'], annotationangle=44, actual_barwidth=.08,
+            # Move the conflict rate labels slightly to the left and right so that
+            # they are easier to read and can be larger without overlapping.
+            # extra_err_fn=lambda expt, loc: (min([e.p99_lat_exec(loc) for e in expt]), max([e.p99_lat_exec(loc) for e in expt]))
+            )
+
+        ax.set_ylabel('Latency (ms)', fontsize=fontsize)
+        # ax.set_title('Zipfian Skew (θ): {}\n% Writes: {}%'.format(theta, 100*writes), fontsize=fontsize)
+
+    # leg = make_legend(ax, [legend_patch_color(color_fn(e)) for e in expts],
+    #     ['No OSC', 'Quorum', 'Quorum Union', 'All', mpaxos[0].description()], ncol=1,
+    #     size=28, loc='upper right', bbox_to_anchor=(0.45, 1.27), squeeze=True)
+    # leg.set_zorder(20)
+
+    # leg = make_legend(axs[0], [legend_patch_color(get_color(e)) for e in expts],
+    #     [e.description() for e in expts], ncol=5, loc='upper left')
+    leg2 = make_legend(ax,
+        [legend_patch_hatch(HATCHES[i]) for i in range(2)] + [patches.Patch(edgecolor='black', facecolor='white')],
+        ['Minimum', 'Mean', 'P99'], ncol=2, loc='upper left', size=30, #squeeze=True,
+        # bbox_to_anchor=(0.48, 1.27)
+        )
+    leg2.set_zorder(20)
+
+    ax.set_xticks([barwidth*i+.04 for i, _ in enumerate(expts)])
+
+    ax.set_xticklabels(['No OSC', 'Quorum', 'Quorum Union', 'All', mpaxos[0].description()],
+        fontsize=fontsize, ha='right', rotation=35)
+    # ax.add_artist(leg)
+
+    plt.savefig(path.join(dirname, 'osc_bar_{}.pdf'.format(loc)))
+
+def conflict_range_annotation(es, loc):
+    if es[0].is_mpaxos(): return ''
+    if is_fixed_epaxos_result(es[0], 0): return ''
+    conflicts = [e.conflict_rate(loc)*100 for e in es]
+    smallest = round(min(conflicts),1)
+    biggest = round(max(conflicts),1)
+    # smallest = trim_zeros(smallest)
+    # biggest = trim_zeros(biggest)
+    if smallest == biggest:
+        return '{}%'.format(smallest)
+    # return '{}—{}%'.format(smallest, biggest)
+    return '{} – {}%'.format(smallest, biggest)
+
+def trim_zeros(x):
+    x = '{}'.format(x)
+    if x.endswith('.0'): x = x[:-2]
+    if x.startswith('0') and len(x) > 1: x = x[1:]
+    return x
+
+def conflict_stdev_annotation(es, loc):
+    if es[0].is_mpaxos(): return ''
+    if is_fixed_epaxos_result(es[0], 0): return ''
+    conflicts = [e.conflict_rate(loc)*100 for e in es]
+    mean = '{}'.format(round(statistics.mean(conflicts),1))
+    stdev = '{}'.format(round(statistics.stdev(conflicts),1))
+    # mean = trim_zeros(mean)
+    # stdev = trim_zeros(stdev)
+    if float(stdev) == 0:
+        return '{}%'.format(mean)
+    return '{}% (±{}%)'.format(mean, stdev)
+
+def thrifty_bar(dirname):
+    """
+    TODO
+    """
+    plt.clf()
+
+    results = get_results(dirname)
+    thrifty = list(filter(lambda r: r.is_epaxos() and r.thrifty(),
+        results))
+    no_thrifty = list(filter(lambda r: r.is_epaxos() and not r.thrifty(),
+        results))
+
+    workloads = [
+        (.7, .3),
+        (.9, .5),
+        (.99, 1)
+    ]
+
+    fig, axs = plt.subplots(len(workloads), 1, figsize=(9, 5*len(workloads)+len(workloads)-1),
+        constrained_layout=True)
+    barwidth = .3
+    # fig, axs = plt.subplots(1, len(workloads), figsize=(5*len(workloads)+len(workloads)-1, 9),
+    #     constrained_layout=True)
+    # barwidth = .2
+    fontsize = 22
+
+    rows = []
+
+    for i, (theta, writes) in enumerate(workloads):
+        ax = axs[i]
+
+        # TODO: multiple trials!
+        thrifty = list(filter(lambda r: r.is_epaxos() and r.thrifty() and \
+            r.theta() == theta and r.frac_writes() == writes, results))
+        no_thrifty = list(filter(lambda r: r.is_epaxos() and not r.thrifty() and \
+            r.theta() == theta and r.frac_writes() == writes, results))
+
+        expts = [thrifty, no_thrifty]
+
+        for e in thrifty:
+            if i == 2:
+                print(e.mean_lat_exec('ca'))
+
+        # Plots mean latency as a bar and 99th percentile latency as an error bar
+        # above it.
+        maxy = 500 #if i != 2 else 7000
+        ystep = 100 #if i != 2 else 1000
+        plot_bar_by_loc(ax, expts, lambda expts, loc: [statistics.mean(expt.mean_lat_exec(loc) for expt in expts), statistics.mean(expt.p99_lat_exec(loc) for expt in expts)],
+            # lambda expt, loc: expt.p99_lat_exec(loc),
+            lambda expts, loc: [(min([e.mean_lat_exec(loc) for e in expts]), max([e.mean_lat_exec(loc) for e in expts])),
+                (min([e.p99_lat_exec(loc) for e in expts]), max([e.p99_lat_exec(loc) for e in expts]))],
+            lambda expts: get_color(expts[0]),
+            conflict_range_annotation, barwidth, fontsize, maxy, ystep, annotationsize=16,
+            hatches=[None, None], hatch_fill=[0], annotationangle=40,
+            # annotationheight=0.6,
+            # Move the conflict rate labels slightly to the left and right so that
+            # they are easier to read and can be larger without overlapping.
+            # annotationhadjust=lambda expti: (-0.05 if expti == 0 else .05),
+            # xlabelhadjust=.12,
+            # extra_err_fn=lambda expts, loc: [min([expt.p99_lat_exec(loc) for expt in expts]),
+            #     max([expt.p99_lat_exec(loc) for expt in expts])]
+            )
+
+        ax.set_ylabel('Mean/P99 Latency (ms)', fontsize=fontsize)
+        ax.set_title('Zipfian Skew (θ): {}\n% Writes: {}%'.format(theta, 100*writes), fontsize=fontsize)
+
+        thrifty = list(filter(lambda r: r.is_epaxos() and r.thrifty() and \
+            r.theta() == theta and r.frac_writes() == writes, results))
+        no_thrifty = list(filter(lambda r: r.is_epaxos() and not r.thrifty() and \
+            r.theta() == theta and r.frac_writes() == writes, results))
+
+        for t, expts in [(False, no_thrifty), (True, thrifty)]:
+            for loc in ORDERED_LOCS:
+                conflicts = [expt.conflict_rate(loc)*100 for expt in expts]
+
+                conflict_str = '{}%'.format(round(statistics.mean(conflicts), 2))
+                if t:
+                    no_t_conflicts = [expt.conflict_rate(loc)*100 for expt in no_thrifty]
+                    conflict_str += ' (+{}%)'.format(round(100*(statistics.mean(conflicts)-statistics.mean(no_t_conflicts))/statistics.mean(no_t_conflicts), 2))
+
+                means = [expt.mean_lat_exec(loc) for expt in expts]
+                p99s = [expt.p99_lat_exec(loc) for expt in expts]
+
+                mean_str = str(round(statistics.mean(means),2))
+                if t:
+                    no_t_means = [expt.mean_lat_exec(loc) for expt in no_thrifty]
+                    mean_str += ' (+{}%)'.format(round(100*(statistics.mean(means)-statistics.mean(no_t_means))/statistics.mean(no_t_means), 2))
+
+                p99_str = str(round(statistics.mean(p99s),2))
+                if t:
+                    no_t_p99s = [expt.p99_lat_exec(loc) for expt in no_thrifty]
+                    p99_str += ' (+{}%)'.format(round(100*(statistics.mean(p99s)-statistics.mean(no_t_p99s))/statistics.mean(no_t_p99s), 2))
+
+                rows.append((writes, theta, t, loc,
+                    conflict_str,
+                    '{}% ({}%)'.format(round(statistics.stdev(conflicts), 2),
+                        round(statistics.stdev(conflicts)/statistics.mean(conflicts)*100, 2)),
+                    mean_str,
+                    round(statistics.stdev(means),2),
+                    p99_str,
+                    round(statistics.stdev(p99s),2),
+                ))
+
+            rows.append(())
+
+        expts = [thrifty[0], no_thrifty[0]]
+
+    make_legend(axs[0], [legend_patch_color(get_color(e)) for e in expts],
+        ['Thrifty', 'No Thrifty'], ncol=3,
+        loc='upper right', size=fontsize)
+
+    plt.savefig(path.join(dirname, 'thrifty_bar.pdf'))
+
+    with open(path.join(dirname, 'thrifty_stats.txt'), 'w') as f:
+        print(tabulate(rows, headers=[
+            'Frac Writes', 'Theta', 'Thrifty', 'Location', 'Conflict Avg',
+            'Conflict Stdev', 'Mean Lat Avg', 'Mean Lat Stdev', 'P99 Lat Avg',
+            'P99 Lat Stdev'], tablefmt='github'), file=f)
 
 def commitvexec_cdf(dirname, loc='or'):
     """
@@ -367,11 +808,14 @@ def commitvexec_cdf(dirname, loc='or'):
     """
     plt.clf()
 
-    expt = get_epaxos_zipf_result(get_results(dirname))
+    results = get_results(dirname)
+    expt = get_epaxos_zipf_result(results)[0]
+    mpaxos = get_mpaxos_result(results)[0]
 
     fig, ax = plt.subplots(figsize=(7, 4), constrained_layout=True)
 
     # Add CDF lines for commit and exec latency.
+    plot_cdf(ax, mpaxos.all_lats_exec(loc), get_color(mpaxos))
     plot_cdf(ax, expt.all_lats_commit(loc), ALTERNATE_ZIPF_COLOR, '--')
     plot_cdf(ax, expt.all_lats_exec(loc), get_color(expt))
 
@@ -383,11 +827,18 @@ def commitvexec_cdf(dirname, loc='or'):
     make_arrow('2 RTTs', expt.p99_lat_commit(loc))
     make_arrow('Bound', sorted(expt.all_lats_exec(loc))[-1])
 
+    print('1 RTT', expt.p50_lat_exec(loc))
+    print('2 RTTs', expt.p99_lat_commit(loc))
+    print('Bound', sorted(expt.all_lats_exec(loc))[-1])
+    print('MPaxos', mpaxos.p50_lat_exec(loc))
+
     format_cdf(ax)
 
     make_legend(ax, [legend_line(get_color(expt)),
-        legend_line(ALTERNATE_ZIPF_COLOR, '--')], ['Exec', 'Commit'],
-        ncol=1, loc='lower left', size=22, squeeze=True)
+        legend_line(ALTERNATE_ZIPF_COLOR, '--'),
+        legend_line(get_color(mpaxos))], ['Exec', 'Commit', mpaxos.description()],
+        ncol=1, loc='lower left', size=22, squeeze=True,
+        bbox_to_anchor=(.5, 0))
 
     ax.set_xlabel('Latency (ms)', fontsize=20)
     ax.set_ylabel('% Operations', fontsize=20)
@@ -395,7 +846,7 @@ def commitvexec_cdf(dirname, loc='or'):
 
     plt.savefig(path.join(dirname, 'commitvexec_cdf_{}.pdf'.format(loc)))
 
-def infinite_cdf(dirname, loc='eu'):
+def infinite_cdf(dirname, loc='or'):
     """
     Generates a CDF graph that compares the execution latency of EPaxos with and
     without a modification that bounds execution delay. 'dirname' is a directory
@@ -407,29 +858,163 @@ def infinite_cdf(dirname, loc='eu'):
     """
     plt.clf()
 
+    fontsize = 24
+
     results = get_results(dirname)
     inffix = list(filter(lambda r: is_epaxos_zipf_result(r) and r.inffix(),
         results))[0]
-    no_inffix = list(filter(lambda r: is_epaxos_zipf_result(r) and not r.inffix(),
+    no_inffixs = list(filter(lambda r: is_epaxos_zipf_result(r) and not r.inffix(),
+        results))
+
+    for no_inffix in no_inffixs:
+        fig, ax = plt.subplots(figsize=(6, 4), constrained_layout=True)
+
+        plot_cdf(ax, inffix.all_lats_exec(loc), get_color(inffix))
+        plot_cdf(ax, no_inffix.all_lats_exec(loc), ALTERNATE_ZIPF_COLOR, '--')
+
+        format_cdf(ax)
+
+        make_legend(ax, [legend_line(get_color(inffix)),
+            legend_line(ALTERNATE_ZIPF_COLOR, '--')][::-1], ['Improved', 'Unmodified'][::-1],
+            ncol=1, loc='lower center', size=fontsize, squeeze=True)
+
+        ax.set_xlabel('Latency (ms)', fontsize=fontsize)
+        ax.set_ylabel('% Operations', fontsize=fontsize)
+        # ax.set_xticks([0, 500, 1000, 1500, 2000])
+        # ax.set_xticks([0, 1250, 2500, 3750, 5000])
+        ax.set_xticks([0, 500, 1000, 1500, 2000, 2500])
+        ax.tick_params(axis='both', labelsize=fontsize)
+
+        plt.savefig(path.join(dirname, 'infinite_cdf_{}_{}.pdf'.format(loc, no_inffix.arrival_rate())))
+
+def or_vs_psn_cdf(dirname, loc='or'):
+    """
+    Generates a CDF graph that compares the execution latency of EPaxos with and
+    without a modification that bounds execution delay. 'dirname' is a directory
+    containing two EPaxos experiments with Zipfian workload, one with the fix
+    and one without. The generated graph is saved as an image in the directory
+    specified by 'dirname'. 'loc' specifies which client location's latency
+    should be plotted; all client locations will show the same patterns, so we
+    only plot one.
+    """
+    plt.clf()
+
+    fontsize = 24
+
+    results = get_results(dirname)
+    psn = list(filter(lambda r: is_epaxos_zipf_result(r) and isinstance(r.arrival_rate(), Experiment.PoissonArrivalRate),
         results))[0]
+    ors = list(filter(lambda r: is_epaxos_zipf_result(r) and isinstance(r.arrival_rate(), Experiment.OutstandingReqArrivalRate),
+        results))
 
-    fig, ax = plt.subplots(figsize=(5, 4), constrained_layout=True)
+    for oreq in ors:
+        fig, ax = plt.subplots(figsize=(6, 4), constrained_layout=True)
 
-    plot_cdf(ax, inffix.all_lats_exec(loc), get_color(inffix))
-    plot_cdf(ax, no_inffix.all_lats_exec(loc), ALTERNATE_ZIPF_COLOR, '--')
+        plot_cdf(ax, psn.all_lats_exec(loc), get_color(psn))
+        plot_cdf(ax, oreq.all_lats_exec(loc), ALTERNATE_ZIPF_COLOR, '--')
 
-    format_cdf(ax)
+        format_cdf(ax)
 
-    make_legend(ax, [legend_line(get_color(inffix)),
-        legend_line(ALTERNATE_ZIPF_COLOR, '--')], ['Improved', 'Unmodified'],
-        ncol=1, loc='upper right', size=22, squeeze=True)
+        make_legend(ax, [legend_line(get_color(psn)),
+            legend_line(ALTERNATE_ZIPF_COLOR, '--')][::-1], ['Poisson', 'Back-to-back'][::-1],
+            ncol=1, loc='lower left', size=fontsize, squeeze=True)
 
-    ax.set_xlabel('Latency (ms)', fontsize=22)
-    ax.set_ylabel('% Operations', fontsize=22)
-    ax.set_xticks([0, 500, 1000, 1500, 2000])
-    ax.tick_params(axis='both', labelsize=22)
+        ax.set_xlabel('Latency (ms)', fontsize=fontsize)
+        ax.set_ylabel('% Operations', fontsize=fontsize)
+        # ax.set_xticks([0, 500, 1000, 1500, 2000])
+        # ax.set_xticks([0, 1250, 2500, 3750, 5000])
+        # ax.set_xticks([0, 500, 1000, 1500, 2000, 2500])
+        ax.set_xticks([0, 500, 1000, 1500])
+        ax.tick_params(axis='both', labelsize=fontsize)
 
-    plt.savefig(path.join(dirname, 'infinite_cdf_{}.pdf'.format(loc)))
+        plt.savefig(path.join(dirname, 'or_vs_psn_cdf_{}_{}.pdf'.format(loc, oreq.arrival_rate())))
+
+def infinite_bar_old(dirname):
+    """
+    Generates a bar graph that compares the execution latency of EPaxos with and
+    without a modification that bounds execution delay. 'dirname' is a directory
+    containing two EPaxos experiments with Zipfian workload, one with the fix
+    and one without, as well as a Multi-Paxos experiment and EPaxos 0%
+    experiment for comparison. The generated graph is saved as an image in the
+    directory specified by 'dirname'.
+    """
+    plt.clf()
+
+    results = get_results(dirname)
+    inffix = list(filter(lambda r: is_epaxos_zipf_result(r) and r.inffix(),
+        results))
+    no_inffix = list(filter(lambda r: is_epaxos_zipf_result(r) \
+        and not r.inffix(), results))
+    epaxos_0 = get_fixed_epaxos_result(results, 0)
+    mpaxos = get_mpaxos_result(results)
+    expts = [epaxos_0, inffix, mpaxos]
+
+    for e in no_inffix:
+        for l in ORDERED_LOCS:
+            print(l, max(e.all_lats_exec(l)))
+        print()
+
+    fig, ax = plt.subplots(1, 1, figsize=(8, 4), constrained_layout=True)
+    barwidth = .25
+    fontsize = 22
+
+    # On the left graph, plot mean commit latency vs. mean exec latency vs.
+    # mean exec latency without modification.
+    def yfn(expt, loc):
+        res = [
+        # statistics.mean([e.mean_lat_commit(loc) for e in expt]),
+        statistics.mean([e.mean_lat_exec(loc) for e in expt])]
+        if expt == inffix:
+            res.append(statistics.mean([x.mean_lat_exec(loc) for x in no_inffix]))
+        return res
+    def errfn(expt, loc):
+        res = [
+            # (min([e.mean_lat_commit(loc) for e in expt]), max([e.mean_lat_commit(loc) for e in expt])),
+            (min([e.mean_lat_exec(loc) for e in expt]), max([e.mean_lat_exec(loc) for e in expt]))]
+        if expt == inffix:
+            res.append((min([x.mean_lat_exec(loc) for x in no_inffix]), max([x.mean_lat_exec(loc) for x in no_inffix])))
+        return res
+    plot_bar_by_loc(ax, expts, yfn, errfn, lambda e: get_color(e[0]), None, barwidth,
+        fontsize, maxy=1250, ystep=250, hatches=[None, '//'], hatch_fill=[0],
+        errwidth=7)
+
+    hatches = [None, '//']
+
+    ax.set_ylabel('Mean Latency (ms)', fontsize=fontsize)
+    leg = make_legend(ax, [legend_patch_color(get_color(e[0])) for e in expts],
+        [e[0].description() for e in expts], ncol=1, loc='upper left')
+    make_legend(ax, [legend_patch_hatch(hatches[i]) for i in range(2)],
+        ['Improved', 'Unmodified'], ncol=2, loc='upper right')
+    ax.add_artist(leg)
+
+    plt.savefig(path.join(dirname, 'infinite_bar_mean.pdf'))
+
+
+    fig, ax = plt.subplots(1, 1, figsize=(8, 4), constrained_layout=True)
+
+    # On the right graph, plot 99th percentile commit latency vs. 99th
+    # percentile exec latency vs. 99th percentile exec latency without
+    # modification.
+    def yfn(expt, loc):
+        res = [
+        # statistics.mean([e.p99_lat_commit(loc) for e in expt]),
+        statistics.mean([e.p99_lat_exec(loc) for e in expt])]
+        if expt == inffix:
+            res.append(statistics.mean([x.p99_lat_exec(loc) for x in no_inffix]))
+        return res
+    def errfn(expt, loc):
+        res = [
+            # (min([e.p99_lat_commit(loc) for e in expt]), max([e.p99_lat_commit(loc) for e in expt])),
+            (min([e.p99_lat_exec(loc) for e in expt]), max([e.p99_lat_exec(loc) for e in expt]))]
+        if expt == inffix:
+            res.append((min([x.p99_lat_exec(loc) for x in no_inffix]), max([x.p99_lat_exec(loc) for x in no_inffix])))
+        return res
+    plot_bar_by_loc(ax, expts, yfn, errfn, lambda e: get_color(e[0]), None, barwidth,
+        fontsize, maxy=5000, ystep=1000, hatches=[None, '//', '.'], hatch_fill=[0],
+        errwidth=7)
+    ax.set_ylabel('P99 Latency (ms)', fontsize=fontsize)
+
+    plt.savefig(path.join(dirname, 'infinite_bar_p99.pdf'))
 
 def infinite_bar(dirname):
     """
@@ -444,54 +1029,118 @@ def infinite_bar(dirname):
 
     results = get_results(dirname)
     inffix = list(filter(lambda r: is_epaxos_zipf_result(r) and r.inffix(),
-        results))[0]
+        results))
     no_inffix = list(filter(lambda r: is_epaxos_zipf_result(r) \
-        and not r.inffix(), results))[0]
+        and not r.inffix(), results))
     epaxos_0 = get_fixed_epaxos_result(results, 0)
     mpaxos = get_mpaxos_result(results)
-    expts = [epaxos_0, inffix, mpaxos]
+    expts = [no_inffix, inffix, mpaxos]
 
-    fig, axs = plt.subplots(1, 2, figsize=(16, 4), constrained_layout=True)
+    # for e in no_inffix:
+    #     for l in ORDERED_LOCS:
+    #         print(l, max(e.all_lats_exec(l)))
+    #     print()
+
+    fig, ax = plt.subplots(1, 1, figsize=(8, 4), constrained_layout=True)
     barwidth = .25
-    fontsize = 20
+    fontsize = 24
+
+    color_fn = lambda e: get_color(e[0]) if e != no_inffix else ALTERNATE_ZIPF_COLOR
 
     # On the left graph, plot mean commit latency vs. mean exec latency vs.
     # mean exec latency without modification.
     def yfn(expt, loc):
-        res = [expt.mean_lat_commit(loc), expt.mean_lat_exec(loc)]
-        if expt == inffix:
-            res.append(no_inffix.mean_lat_exec(loc))
+        res = [
+        # statistics.mean([e.mean_lat_commit(loc) for e in expt]),
+        statistics.mean([e.mean_lat_exec(loc) for e in expt])]
+        # if expt == inffix:
+        #     res.append(statistics.mean([x.mean_lat_exec(loc) for x in no_inffix]))
         return res
-    plot_bar_by_loc(axs[0], expts, yfn, None, get_color, None, barwidth,
-        fontsize, maxy=400, ystep=100)
+    def errfn(expt, loc):
+        res = [
+            # (min([e.mean_lat_commit(loc) for e in expt]), max([e.mean_lat_commit(loc) for e in expt])),
+            (min([e.mean_lat_exec(loc) for e in expt]), max([e.mean_lat_exec(loc) for e in expt]))]
+        # if expt == inffix:
+        #     res.append((min([x.mean_lat_exec(loc) for x in no_inffix]), max([x.mean_lat_exec(loc) for x in no_inffix])))
+        return res
+    plot_bar_by_loc(ax, expts, yfn, errfn, color_fn, None, barwidth,
+        fontsize, maxy=1000, ystep=250, hatches=[None, '//'], hatch_fill=[0],
+        errwidth=7)
+
+    hatches = [None, '//']
+
+    ax.set_ylabel('Mean Latency (ms)', fontsize=fontsize)
+    leg = make_legend(ax, [legend_patch_color(color_fn(e)) for e in expts],
+        ['Unmodified', 'Improved', 'MPaxos'], ncol=2, loc='upper left', size=22, squeeze=True)
+    # make_legend(ax, [legend_patch_hatch(hatches[i]) for i in range(2)],
+    #     ['Improved', 'Unmodified'], ncol=2, loc='upper right')
+    # ax.add_artist(leg)
+
+    plt.savefig(path.join(dirname, 'infinite_bar_mean.pdf'))
+
+
+    fig, ax = plt.subplots(1, 1, figsize=(8, 4), constrained_layout=True)
+
     # On the right graph, plot 99th percentile commit latency vs. 99th
     # percentile exec latency vs. 99th percentile exec latency without
     # modification.
     def yfn(expt, loc):
-        res = [expt.p99_lat_commit(loc), expt.p99_lat_exec(loc)]
-        if expt == inffix:
-            res.append(no_inffix.p99_lat_exec(loc))
+        res = [
+        # statistics.mean([e.p99_lat_commit(loc) for e in expt]),
+        statistics.mean([e.p99_lat_exec(loc) for e in expt])]
+        # if expt == inffix:
+        #     res.append(statistics.mean([x.p99_lat_exec(loc) for x in no_inffix]))
         return res
-    plot_bar_by_loc(axs[1], expts, yfn, None, get_color, None, barwidth,
-        fontsize, maxy=1500, ystep=250)
+    def errfn(expt, loc):
+        res = [
+            # (min([e.p99_lat_commit(loc) for e in expt]), max([e.p99_lat_commit(loc) for e in expt])),
+            (min([e.p99_lat_exec(loc) for e in expt]), max([e.p99_lat_exec(loc) for e in expt]))]
+        # if expt == inffix:
+        #     res.append((min([x.p99_lat_exec(loc) for x in no_inffix]), max([x.p99_lat_exec(loc) for x in no_inffix])))
+        return res
+    plot_bar_by_loc(ax, expts, yfn, errfn, color_fn, None, barwidth,
+        fontsize, maxy=4500, ystep=1000, hatches=[None, '//', '.'], hatch_fill=[0],
+        errwidth=7)
+    ax.set_ylabel('P99 Latency (ms)', fontsize=fontsize)
 
-    axs[0].set_ylabel('Mean Latency (ms)', fontsize=fontsize)
-    axs[1].set_ylabel('P99 Latency (ms)', fontsize=fontsize)
+    plt.savefig(path.join(dirname, 'infinite_bar_p99.pdf'))
 
-    leg = make_legend(axs[0], [legend_patch_color(get_color(e)) for e in expts],
-        [e.description() for e in expts], ncol=1, loc='upper left')
-    make_legend(axs[0], [legend_patch_hatch(HATCHES[i]) for i in range(3)],
-        ['Commit', 'Exec, Improved', 'Exec'], ncol=2, loc='upper right')
-    axs[0].add_artist(leg)
+def client_metrics_over_time(dirname, loc='or'):
+    plt.clf()
 
-    plt.savefig(path.join(dirname, 'infinite_bar.pdf'))
+    results = get_results(dirname)
+    expt = get_epaxos_zipf_result(results)[0]
+    no_inffix = list(filter(lambda r: is_epaxos_zipf_result(r) and not r.inffix(),
+        results))
+    for i, expt in enumerate(results):#enumerate(no_inffix):
+        fig, ax = plt.subplots(figsize=(5, 3), constrained_layout=True)
+
+        # cap = 1500
+        timestamps, lats, tputs, oreqs = expt.parse_lattput(loc)
+
+        # ax.plot(timestamps, lats, label="Avg Latency")
+        ax.plot(timestamps, tputs, label="Throughput")
+        ax.plot(timestamps, oreqs, label="Outstanding")
+        ax.plot(timestamps, [10*10 for _ in timestamps], label="Cap")
+
+        ax.legend()
+
+        ax.set_xlabel('Time (s)')
+        ax.set_ylabel('# Operations')
+
+        ax.grid()
+
+        plt.savefig(path.join(dirname, 'client_metrics_over_time_{}_{}.pdf'.format(loc, expt.arrival_rate())))
 
 if __name__ == '__main__':
     """
-    Plots all graphs for experiments that have already been run.
+    Plots graphs for experiments that have already been run.
     """
     reproduction_bar('results/reproduction')
     batching_bar('results/batching')
     commitvexec_cdf('results/commitvexec')
-    infinite_cdf('results/inffix')
-    infinite_bar('results/inffix')
+    thrifty_bar('results/thrifty')
+    osc_bar('results/osc')
+    osc_bar_loc('results/osc')
+    client_metrics_over_time('results/commitvexec')
+

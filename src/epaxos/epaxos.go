@@ -339,12 +339,11 @@ func (r *Replica) run() {
 		if r.clockSyncType != CLOCK_SYNC_NONE {
 			peakPriority := r.clockSyncPQ.PeakPriority()
 			currTime := genericsmr.CurrentTime()
-			if peakPriority == priorityqueue.PRI_INVALID ||
-				currTime < peakPriority {
-				break
+			if peakPriority != priorityqueue.PRI_INVALID &&
+				currTime >= peakPriority {
+				pa := r.clockSyncPQ.Pop().(*epaxosproto.PreAccept)
+				r.handlePreAccept(pa)
 			}
-			pa := r.clockSyncPQ.Pop().(*epaxosproto.PreAccept)
-			r.handlePreAccept(pa)
 		}
 
 		select {
@@ -471,10 +470,13 @@ func (r *Replica) run() {
 			break
 
 		case metricsRequest := <-r.MetricsChan:
+			log.Println("Received metrics request")
+
 			reply := &genericsmrproto.MetricsReply{}
 
 			switch metricsRequest.OpCode {
 			case genericsmrproto.METRICSOP_CONFLICT_RATE:
+				log.Println("Responding to metrics request")
 				reply.KFast = r.kFast
 				reply.KSlow = r.kSlow
 				break
@@ -487,6 +489,7 @@ func (r *Replica) run() {
 			reply.Marshal(metricsRequest.Reply)
 			metricsRequest.Reply.Flush()
 			break
+
 		default:
 			break
 		}

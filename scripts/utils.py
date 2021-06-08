@@ -26,14 +26,16 @@ import sys
 import time
 from tqdm import tqdm
 
-def execute(command, desc):
+def execute(cmd, desc):
     """
     Runs 'command' as a shell process, returning a function handler that will
     wait for the process to complete when called. 'desc' provides identifying
     information about the command.
     """
+    if isinstance(cmd, list): cmd = '; '.join(cmd)
+
     p = subprocess.Popen(
-        command,
+        cmd,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         text=True,
