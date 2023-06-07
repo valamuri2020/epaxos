@@ -1,6 +1,8 @@
 package main
 
+// finds this from where we start the server
 import (
+	"configuration"
 	"epaxos"
 	"flag"
 	"fmt"
@@ -14,14 +16,15 @@ import (
 	"paxos"
 	"runtime"
 	"runtime/pprof"
+	"strconv"
 	"time"
 )
 
-var portnum *int = flag.Int("port", 7070, "Port # to listen on. Defaults to 7070")
+var id *string = flag.String("id", "0", "ID of replica")
+var config *string = flag.String("config", "", "path to config file")
 var masterAddr *string = flag.String("maddr", "", "Master address. Defaults to localhost.")
 var masterPort *int = flag.Int("mport", 7087, "Master port.  Defaults to 7087.")
-var myAddr *string = flag.String("addr", "", "Server address (this machine). Defaults to localhost.")
-var doEpaxos *bool = flag.Bool("e", false, "Use EPaxos as the replication protocol. Defaults to false.")
+var doEpaxos *bool = flag.Bool("e", true, "Use EPaxos as the replication protocol. Defaults to false.")
 var procs *int = flag.Int("p", 2, "GOMAXPROCS. Defaults to 2")
 var cpuprofile = flag.String("cpuprofile", "", "write cpu profile to file")
 var thrifty = flag.Bool("thrifty", false, "Use only as many messages as strictly required for inter-replica communication.")
@@ -32,8 +35,17 @@ var infiniteFix = flag.Bool("inffix", false, "Enables a bound on execution laten
 var clockSyncType = flag.Int("clocksync", 0, "0 to not sync clocks, 1 to delay the opening of messages until the quorum, 2 to delay so that all process at same time, 3 to delay to CA, VA, and OR.")
 var clockSyncEpsilon = flag.Float64("clockepsilon", 4, "The number of milliseconds to add as buffer for OpenAfter times.")
 
+var portNum int
+var myAddr string
+
 func main() {
 	flag.Parse()
+	config := configuration.GetConfig()
+	config.Print()
+
+	ID := (configuration.ID)(*id)
+	myAddr = config.Addrs[ID]
+	portNum, _ = strconv.Atoi(config.Ports[ID])
 
 	runtime.GOMAXPROCS(*procs)
 
@@ -49,9 +61,11 @@ func main() {
 		go catchKill(interrupt)
 	}
 
-	log.Printf("Server starting on port %d\n", *portnum)
+	log.Printf("Server starting on port %v\n", portNum)
 
 	replicaId, nodeList := registerWithMaster(fmt.Sprintf("%s:%d", *masterAddr, *masterPort))
+
+	fmt.Println("ReplicaID: ", replicaId, "NodeList: ", nodeList)
 
 	if *doEpaxos {
 		log.Println("Starting Egalitarian Paxos replica...")
@@ -67,7 +81,8 @@ func main() {
 
 	rpc.HandleHTTP()
 	//listen for RPC on a different port (8070 by default)
-	l, err := net.Listen("tcp", fmt.Sprintf(":%d", *portnum+1000))
+
+	l, err := net.Listen("tcp", fmt.Sprintf(":%d", portNum+1000))
 	if err != nil {
 		log.Fatal("listen error:", err)
 	}
@@ -76,7 +91,7 @@ func main() {
 }
 
 func registerWithMaster(masterAddr string) (int, []string) {
-	args := &masterproto.RegisterArgs{*myAddr, *portnum}
+	args := &masterproto.RegisterArgs{myAddr, portNum}
 	var reply masterproto.RegisterReply
 
 	for done := false; !done; {
