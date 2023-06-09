@@ -7,7 +7,6 @@ import (
 	"flag"
 	"fmt"
 	"log"
-	"masterproto"
 	"net"
 	"net/http"
 	"net/rpc"
@@ -17,7 +16,6 @@ import (
 	"runtime"
 	"runtime/pprof"
 	"strconv"
-	"time"
 )
 
 var id *string = flag.String("id", "0", "ID of replica")
@@ -35,18 +33,19 @@ var infiniteFix = flag.Bool("inffix", false, "Enables a bound on execution laten
 var clockSyncType = flag.Int("clocksync", 0, "0 to not sync clocks, 1 to delay the opening of messages until the quorum, 2 to delay so that all process at same time, 3 to delay to CA, VA, and OR.")
 var clockSyncEpsilon = flag.Float64("clockepsilon", 4, "The number of milliseconds to add as buffer for OpenAfter times.")
 
-var portNum int
-var myAddr string
-
 func main() {
 	flag.Parse()
 	config := configuration.GetConfig()
 	config.Print()
 
 	ID := (configuration.ID)(*id)
-	myAddr = config.Addrs[ID]
-	portNum, _ = strconv.Atoi(config.Ports[ID])
+	nodeList := make([]string, config.N)
+	for _, addr := range config.Addrs {
+		nodeList = append(nodeList, addr)
+	}
 
+	portNum, _ := strconv.Atoi(config.Ports[ID])
+	replicaId, _ := strconv.Atoi(ID)
 	runtime.GOMAXPROCS(*procs)
 
 	if *cpuprofile != "" {
@@ -63,10 +62,8 @@ func main() {
 
 	log.Printf("Server starting on port %v\n", portNum)
 
-	replicaId, nodeList := registerWithMaster(fmt.Sprintf("%s:%d", *masterAddr, *masterPort))
-
 	fmt.Println("ReplicaID: ", replicaId, "NodeList: ", nodeList)
-
+	// Should be like ReplicaID:  1 NodeList:  [127.0.0.1:7074 127.0.0.1:7075 127.0.0.1:7076]
 	if *doEpaxos {
 		log.Println("Starting Egalitarian Paxos replica...")
 		rep := epaxos.NewReplica(replicaId, nodeList, *thrifty, *beacon,
@@ -88,25 +85,6 @@ func main() {
 	}
 
 	http.Serve(l, nil)
-}
-
-func registerWithMaster(masterAddr string) (int, []string) {
-	args := &masterproto.RegisterArgs{myAddr, portNum}
-	var reply masterproto.RegisterReply
-
-	for done := false; !done; {
-		mcli, err := rpc.DialHTTP("tcp", masterAddr)
-		if err == nil {
-			err = mcli.Call("Master.Register", args, &reply)
-			if err == nil && reply.Ready == true {
-				done = true
-				break
-			}
-		}
-		time.Sleep(1e9)
-	}
-
-	return reply.ReplicaId, reply.NodeList
 }
 
 func catchKill(interrupt chan os.Signal) {
