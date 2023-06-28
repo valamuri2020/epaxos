@@ -2,271 +2,409 @@ package main
 
 import (
 	"bufio"
-	"context"
+	"bytes"
+	"configuration"
+	"dlog"
+	"encoding/gob"
 	"flag"
 	"fmt"
 	"genericsmrproto"
-	"golang.org/x/sync/semaphore"
+	"kvproto"
 	"log"
-	"masterproto"
 	"math/rand"
 	"net"
-	"net/rpc"
 	"os"
-	"poisson"
-	"runtime"
+	"sort"
 	"state"
 	"sync"
 	"time"
-	"zipfian"
+	"util"
 )
 
-var masterAddr *string = flag.String("maddr", "", "Master address. Defaults to localhost")
-var masterPort *int = flag.Int("mport", 7087, "Master port.")
-var procs *int = flag.Int("p", 2, "GOMAXPROCS.")
-var conflicts *int = flag.Int("c", 0, "Percentage of conflicts. If -1, uses Zipfian distribution.")
-var forceLeader = flag.Int("l", -1, "Force client to talk to a certain replica.")
+var serverId = flag.Int("id", 0, "Id of server")
 var startRange = flag.Int("sr", 0, "Key range start")
-var T = flag.Int("T", 10, "Number of threads (simulated clients).")
-var outstandingReqs = flag.Int64("or", 1, "Number of outstanding requests a thread can have at any given time.")
-var theta = flag.Float64("theta", 0.99, "Theta zipfian parameter")
-var zKeys = flag.Uint64("z", 1e9, "Number of unique keys in zipfian distribution.")
-var poissonAvg = flag.Int("poisson", -1, "The average number of microseconds between requests. -1 disables Poisson.")
-var percentWrites = flag.Float64("writes", 1, "A float between 0 and 1 that corresponds to the percentage of requests that should be writes. The remainder will be reads.")
-var blindWrites = flag.Bool("blindwrites", false, "True if writes don't need to execute before clients receive responses.")
+var sport = flag.Int("sport", 7070, "the port of the server")
+var separate = flag.Bool("sp", false, "each batch contain one opeartion type")
+var algo = flag.String("algo", "epaxos", "algorithm")
 
-// Information about the latency of an operation
-type response struct {
-	receivedAt    time.Time
-	rtt           float64 // The operation latency, in ms
-	commitLatency float64 // The operation's commit latency, in ms
+var INV = uint8(0)
+var RES = uint8(1)
+var config configuration.Config
+
+func init() {
+	config = configuration.GetConfig()
+	flag.Parse()
+	dlog.Setup(*serverId)
 }
 
-// Information pertaining to operations that have been issued but that have not
-// yet received responses
-type outstandingRequestInfo struct {
-	sync.Mutex
-	sema       *semaphore.Weighted // Controls number of outstanding operations
-	startTimes map[int32]time.Time // The time at which operations were sent out
+type Summary struct {
+	AckNum     int
+	TotalLat   int64
+	LatArray   []int64
+	MaxLat     int64
+	TotalQueue int64
+	TotalPrc   int64
+	TotalExec  int64
+	TotalSlow  int64
+	TotalRead  int64
 }
 
-// An outstandingRequestInfo per client thread
-var orInfos []*outstandingRequestInfo
+type OperationLog struct {
+	Type uint8
+	Op   kvproto.Operation
+	K    kvproto.Key
+	V    kvproto.Value
+	Ts   int64
+}
 
 func main() {
-	flag.Parse()
+	b := config.Benchmark
+	conflicts := b.Conflicts
+	readRatio := 1 - b.W
+	reqNum := b.Throttle
+	batchSize := config.BatchSize
+	concurrency := b.Concurrency
 
-	runtime.GOMAXPROCS(*procs)
-
-	if *conflicts > 100 {
+	if conflicts > 100 {
 		log.Fatalf("Conflicts percentage must be between 0 and 100.\n")
 	}
 
-	orInfos = make([]*outstandingRequestInfo, *T)
+	//generating keys
+	tsArray := make([]int64, reqNum)
+	ackTsArray := make([]int64, reqNum)
+	//is it a read
+	readArray := make([]bool, reqNum)
+	kArray := make([]int64, reqNum)
 
-	var master *rpc.Client
-	var err error
-	for {
-		master, err = rpc.DialHTTP("tcp", fmt.Sprintf("%s:%d", *masterAddr, *masterPort))
-		if err != nil {
-			log.Println("Error connecting to master", err)
+	log.Printf("Zipfan Theta %f\n, ReadRatio: %f, Con: %d", b.ZipfianS, readRatio, concurrency)
+	// log.Printf("Config %v", config)
+
+	// zipGenerator := util.NewZipfianWithItems(int64(b.K), b.ZipfianTheta)
+	// log.Printf("KeySpaace %d", int64(b.K))
+	zipGenerator := util.NewZipfianWithItems(int64(b.K), b.ZipfianTheta)
+	// seed := rand.New(rand.NewSource(time.Now().UTC().UnixNano()))
+	// seed := rand.New(rand.NewSource(int64(*serverId)))
+	seed := rand.New(rand.NewSource(int64(*serverId)))
+	for i := 0; i < reqNum; i++ {
+		if b.Distribution == "zipfan" {
+			kArray[i] = zipGenerator.Next(seed)
+			// kArray[i] = 42
+			// kArray[i] = int64(*serverId*1000000 + i)
+			// log.Printf("Key is %d", kArray[i])
 		} else {
-			break
-		}
-	}
-
-	rlReply := new(masterproto.GetReplicaListReply)
-	for !rlReply.Ready {
-		err := master.Call("Master.GetReplicaList", new(masterproto.GetReplicaListArgs), rlReply)
-		if err != nil {
-			log.Println("Error making the GetReplicaList RPC", err)
-		}
-	}
-
-	leader := 0
-	if *forceLeader < 0 {
-		reply := new(masterproto.GetLeaderReply)
-		if err = master.Call("Master.GetLeader", new(masterproto.GetLeaderArgs), reply); err != nil {
-			log.Println("Error making the GetLeader RPC:", err)
-		}
-		leader = reply.LeaderId
-	} else {
-		leader = *forceLeader
-	}
-	log.Printf("The leader is replica %d\n", leader)
-
-	readings := make(chan *response, 100000)
-
-	for i := 0; i < *T; i++ {
-		server, err := net.Dial("tcp", rlReply.ReplicaList[leader])
-		if err != nil {
-			log.Fatalf("Error connecting to replica %d\n", leader)
-		}
-		reader := bufio.NewReader(server)
-		writer := bufio.NewWriter(server)
-
-		orInfo := &outstandingRequestInfo{
-			sync.Mutex{},
-			semaphore.NewWeighted(*outstandingReqs),
-			make(map[int32]time.Time, *outstandingReqs),
-		}
-
-		go simulatedClientWriter(writer, orInfo)
-		go simulatedClientReader(reader, orInfo, readings)
-
-		orInfos[i] = orInfo
-	}
-
-	printer(readings)
-}
-
-func simulatedClientWriter(writer *bufio.Writer, orInfo *outstandingRequestInfo) {
-	args := genericsmrproto.Propose{0 /* id */, state.Command{state.PUT, 0, 0}, 0 /* timestamp */}
-
-	conflictRand := rand.New(rand.NewSource(time.Now().UnixNano()))
-	zipf := zipfian.NewZipfianGenerator(*zKeys, *theta)
-	poissonGenerator := poisson.NewPoisson(*poissonAvg)
-	opRand := rand.New(rand.NewSource(time.Now().UnixNano()))
-
-	queuedReqs := 0 // The number of poisson departures that have been missed
-
-	for id := int32(0); ; id++ {
-		args.CommandId = id
-
-		// Determine key
-		if *conflicts >= 0 {
-			r := conflictRand.Intn(100)
-			if r < *conflicts {
-				args.Command.K = 42
+			r := rand.Intn(100)
+			if r < conflicts {
+				kArray[i] = 42
 			} else {
-				args.Command.K = state.Key(*startRange + 43 + int(id))
+				//we don't care about the conflict rate send to the same leader
+				kArray[i] = int64(*startRange + 43 + i)
 			}
-		} else {
-			args.Command.K = state.Key(zipf.NextNumber())
 		}
+		tsArray[i] = 0
+		ackTsArray[i] = 0
+	}
 
-		// Determine operation type
-		if *percentWrites > opRand.Float64() {
-			if !*blindWrites {
-				args.Command.Op = state.PUT // write operation
-			} else {
-				args.Command.Op = state.PUT_BLIND
-			}
-		} else {
-			args.Command.Op = state.GET // read operation
+	log.Printf("Client %d: KeyArray is %v\n", *serverId, kArray)
+
+	for i := 0; i < reqNum; {
+		bNum := min(batchSize, reqNum-i)
+		isRead := false
+		if rand.Float64() < readRatio {
+			isRead = true
 		}
-
-		if *poissonAvg == -1 { // Poisson disabled
-			orInfo.sema.Acquire(context.Background(), 1)
-		} else {
-			for {
-				if orInfo.sema.TryAcquire(1) {
-					if queuedReqs == 0 {
-						time.Sleep(poissonGenerator.NextArrival())
-					} else {
-						queuedReqs -= 1
-					}
-					break
+		if *separate {
+			for j := 0; j < bNum; j++ {
+				readArray[i] = isRead
+				if isRead {
 				}
-				time.Sleep(poissonGenerator.NextArrival())
-				queuedReqs += 1
+				i++
 			}
+		} else {
+			readArray[i] = isRead
+			i++
 		}
+	}
 
-		before := time.Now()
-		writer.WriteByte(genericsmrproto.PROPOSE)
-		args.Marshal(writer)
+	outfilelock := &sync.Mutex{}
+	outFileName := "./linearizability.out"
+	f, _ := os.Create(outFileName)
+	defer f.Close()
+	w := bufio.NewWriter(f)
+	//write to linearizabilty out
+	defer w.Flush()
+	server, err := net.Dial("tcp", fmt.Sprintf(":%d", *sport))
+	if err != nil {
+		log.Printf("Error connecting to replica %d\n", *serverId, err)
+	}
+	reader := bufio.NewReader(server)
+	writer := bufio.NewWriter(server)
+	// inFlight := make(chan bool, (reqNum/batchSize)+1)
+	totalCount := 0
+	totalLatency := int64(0)
+	var respSummary Summary
+
+	if *algo == "abd" {
+		inFlight := make(chan bool, concurrency)
+		done := make(chan Summary)
+		go abdClient(writer, 0, kArray, readArray, reqNum, inFlight, outfilelock, w)
+		go getAbdResponse(reader, done, inFlight)
+		respSummary = <-done
+		totalCount = respSummary.AckNum
+		totalLatency = respSummary.TotalLat
+	} else { //epaxos
+		inFlight := make(chan int, concurrency)
+		done := make(chan Summary)
+		go epaxosClient(writer, kArray, readArray, reqNum, inFlight, outfilelock, w)
+		go readFastEpaxosResponse(reader, inFlight, done)
+		respSummary = <-done
+		totalCount = respSummary.AckNum
+		totalLatency = respSummary.TotalLat
+		//epaxos does not differentiate reand or write
+		respSummary.TotalRead = int64(totalCount)
+	}
+
+	log.Printf("Throughput: %d req/s", totalCount/b.T)
+	log.Printf("Lat per req: %d ms\n", totalLatency/int64(totalCount))
+	log.Printf("Total latency: %d ms\n", totalLatency)
+	log.Printf("Total slow %d\n", respSummary.TotalSlow)
+	log.Printf("Slow rate %f\n", float64(respSummary.TotalSlow)/float64(respSummary.TotalRead))
+	stat := Statistic(respSummary.LatArray[:totalCount])
+	log.Println(stat)
+
+	dlog.Infof("Throughput: %d req/s", totalCount/b.T)
+	dlog.Infof("Lat per req: %d ms\n", totalLatency/int64(totalCount))
+	dlog.Infof("Total latency: %d ms\n", totalLatency)
+	dlog.Infof("Total slow %d\n", respSummary.TotalSlow)
+	dlog.Infof("Slow rate %f\n", float64(respSummary.TotalSlow)/float64(respSummary.TotalRead))
+	dlog.Info(stat)
+
+	if b.DumpLatency {
+		stat.WriteFile("latency." + fmt.Sprint(*serverId) + ".out")
+	}
+
+	server.Close()
+}
+
+func min(x, y int) int {
+	if x > y {
+		return y
+	}
+	return x
+}
+
+// send a single object
+func sendObject(writer *bufio.Writer, object interface{}) {
+	var bbuf bytes.Buffer
+	var byteMsg []byte
+	encoder := gob.NewEncoder(&bbuf)
+	encoder.Encode(object)
+	byteMsg = bbuf.Bytes()
+	writer.Write(byteMsg)
+	writer.Flush()
+}
+
+func abdClient(
+	writer *bufio.Writer,
+	clientId int,
+	kArray []int64,
+	rArray []bool,
+	txnNum int,
+	inFlight chan bool,
+	fileLock *sync.Mutex,
+	fileWriter *bufio.Writer) {
+	time.Sleep(time.Duration(*serverId) * time.Millisecond)
+	batchSize := config.BatchSize
+	cmd := kvproto.Command{Op: kvproto.PUT, K: 0, Val: 0}
+	n := txnNum //per client txn number
+	batchNum := (n / batchSize) + 1
+	log.Printf("Total req num is %d\n", n)
+	benchTime := config.Benchmark.T
+	batchInterval := time.Duration(config.Benchmark.T * 1e9 / batchNum)
+	ticker := time.NewTicker(batchInterval)
+	timer := time.NewTimer(time.Duration(benchTime) * time.Second)
+	i := 0
+loop:
+	for i < n {
+		select {
+		case <-timer.C:
+			break loop
+		default:
+			//construct transaction
+			bNum := min(batchSize, n-i)
+			var txn kvproto.Transaction
+			for j := 0; j < bNum; j++ {
+				cmd.K = kvproto.Key(kArray[clientId*txnNum+i])
+				if rArray[i] {
+					cmd.Op = kvproto.GET
+				} else {
+					cmd.Op = kvproto.PUT
+					cmd.Val = kvproto.Value(rand.Int63n(10000000))
+				}
+
+				txn.Commands = append(txn.Commands, cmd)
+				i++
+			}
+
+			if rArray[i-1] {
+				txn.ReadOnly = 1
+			} else {
+				txn.ReadOnly = 0
+			}
+
+			//Hack: to avoid deadlock
+			sort.Slice(txn.Commands, func(i, j int) bool {
+				return txn.Commands[i].K < txn.Commands[j].K
+			})
+
+			<-ticker.C
+			txn.Ts = util.MakeTimestamp(0)
+			txn.TID = int64(i)
+			sendObject(writer, txn)
+			inFlight <- true
+		}
+	}
+	log.Printf("Out of loop %d\n", i)
+}
+
+func getAbdResponse(reader *bufio.Reader, done chan Summary, inFlight chan bool) {
+	var summary Summary //result summary
+	summary.LatArray = make([]int64, config.Benchmark.Throttle)
+	timer := time.NewTimer(time.Duration(config.Benchmark.T) * time.Second)
+	idx := 0
+	batchSize := config.BatchSize
+	// reqNum := config.Benchmark.Throttle
+	// batchNum := reqNum/batchSize + 1
+	respMap := make(map[int64]int)
+	respChan := make(chan kvproto.Response, config.BufferSize)
+
+	go func() {
+		for {
+			gobReader := gob.NewDecoder(reader)
+			var resp kvproto.Response
+			if err := gobReader.Decode(&resp); err != nil {
+				// log.Println("Error when reading:", err)
+				continue
+			}
+			respChan <- resp
+		}
+	}()
+
+loop:
+	for {
+		select {
+		case <-timer.C:
+			break loop
+		case resp := <-respChan:
+			tsNow := util.MakeTimestamp(0)
+			summary.AckNum += resp.Size
+			respMap[resp.TID] += resp.Size
+			for i := 0; i < resp.Size; i++ {
+				summary.LatArray[idx] = tsNow - resp.Ts
+				idx++
+			}
+			summary.TotalLat += (tsNow - resp.Ts) * int64(resp.Size)
+			if respMap[resp.TID] == batchSize {
+				//complte a btach
+				// log.Print("Complete a batch\n")
+				<-inFlight
+			}
+
+			if len(resp.Vals) > 0 {
+				summary.TotalRead += int64(resp.Size)
+				if resp.IsFast == uint8(0) {
+					//is slow response
+					summary.TotalSlow += int64(resp.Size)
+				}
+			}
+
+		}
+	}
+	log.Print("Client done\n")
+	done <- summary
+}
+
+func epaxosClient(writer *bufio.Writer,
+	kArray []int64, rArray []bool, txnNum int, inFlight chan int,
+	fileLock *sync.Mutex, fileWriter *bufio.Writer) {
+	time.Sleep(time.Duration(*serverId) * time.Millisecond)
+	batchSize := config.BatchSize
+	log.Printf("Total req num is %d\n", txnNum)
+	var dummyValue state.Value
+	testStart := time.Now()
+	benchTime := config.Benchmark.T
+	batchNum := (txnNum / batchSize) + 1
+	batchInterval := time.Duration(config.Benchmark.T * 1e9 / batchNum)
+	ticker := time.NewTicker(batchInterval)
+	i := 0
+	for i < txnNum {
+		args := genericsmrproto.Propose{
+			CommandId: 0,
+			Command: state.Command{
+				Op: state.PUT,
+				K:  0,
+				V:  dummyValue},
+		}
+		now := time.Now()
+		if (now.Sub(testStart)).Seconds() > float64(benchTime) {
+			break //terminate test
+		}
+		//construct send
+		//write in a batch
+		bNum := min(batchSize, txnNum-i)
+		//i_start := i
+		timeInt64 := util.MakeTimestamp(0)
+		for j := 0; j < bNum; j++ {
+			args.Timestamp = timeInt64
+			args.Command.K = state.Key(kArray[i])
+			if rArray[i] {
+				args.Command.Op = state.GET
+			} else {
+				args.Command.Op = state.PUT
+				args.Command.V = state.Value(rand.Int63n(10000000))
+			}
+			writer.WriteByte(genericsmrproto.PROPOSE)
+			args.Marshal(writer)
+			i++
+		}
+		inFlight <- bNum
 		writer.Flush()
-
-		orInfo.Lock()
-		orInfo.startTimes[id] = before
-		orInfo.Unlock()
+		<-ticker.C
 	}
+	log.Printf("Out of loop3 %d, interval %d \n", i, batchInterval)
 }
 
-func simulatedClientReader(reader *bufio.Reader, orInfo *outstandingRequestInfo, readings chan *response) {
-	var reply genericsmrproto.ProposeReply
+func readFastEpaxosResponse(
+	reader *bufio.Reader,
+	inFlight chan int,
+	done chan Summary) {
+	var summary Summary //result summary
+	summary.LatArray = make([]int64, config.Benchmark.Throttle)
+	benchTime := config.Benchmark.T
+	reply := new(genericsmrproto.ProposeReply)
+	timer := time.NewTimer(time.Duration(benchTime) * time.Second)
+	idx := 0
 
+loop:
 	for {
-		if err := reply.Unmarshal(reader); err != nil || reply.OK == 0 {
-			log.Println("Error when reading:", err)
-			break
-		}
-		after := time.Now()
-
-		orInfo.sema.Release(1)
-
-		orInfo.Lock()
-		before := orInfo.startTimes[reply.CommandId]
-		delete(orInfo.startTimes, reply.CommandId)
-		orInfo.Unlock()
-
-		rtt := (after.Sub(before)).Seconds() * 1000
-		commitToExec := float64(reply.Timestamp) / 1e6
-		commitLatency := rtt - commitToExec
-
-		readings <- &response{
-			after,
-			rtt,
-			commitLatency,
+		select {
+		case bSize := <-inFlight:
+			for i := 0; i < bSize; i++ {
+				if err := reply.Unmarshal(reader); err != nil {
+					log.Println("Error when reading:", err)
+					continue
+				}
+				timeInt64 := util.MakeTimestamp(0)
+				lat := timeInt64 - reply.Timestamp
+				// summary.TotalSlow += int64(reply.Slow)
+				summary.AckNum += 1
+				summary.LatArray[idx] = lat
+				summary.TotalLat += lat
+				idx++
+			}
+		case <-timer.C:
+			break loop
 		}
 	}
-}
-
-func printer(readings chan *response) {
-	lattputFile, err := os.Create("lattput.txt")
-	if err != nil {
-		log.Println("Error creating lattput file", err)
-		return
-	}
-	lattputFile.WriteString("# time (ns), avg lat over the past second, tput since last line, total count, totalOrs, avg commit lat over the past second\n")
-
-	latFile, err := os.Create("latency.txt")
-	if err != nil {
-		log.Println("Error creating latency file", err)
-		return
-	}
-	latFile.WriteString("# time (ns), latency, commit latency\n")
-
-	startTime := time.Now()
-
-	for {
-		time.Sleep(time.Second)
-
-		count := len(readings)
-		var sum float64 = 0
-		var commitSum float64 = 0
-		endTime := time.Now() // Set to current time in case there are no readings
-		for i := 0; i < count; i++ {
-			resp := <-readings
-
-			// Log all to latency file
-			latFile.WriteString(fmt.Sprintf("%d %f %f\n", resp.receivedAt.UnixNano(), resp.rtt, resp.commitLatency))
-			sum += resp.rtt
-			commitSum += resp.commitLatency
-			endTime = resp.receivedAt
-		}
-
-		var avg float64
-		var avgCommit float64
-		var tput float64
-		if count > 0 {
-			avg = sum / float64(count)
-			avgCommit = commitSum / float64(count)
-			tput = float64(count) / endTime.Sub(startTime).Seconds()
-		}
-
-		totalOrs := 0
-		for i := 0; i < *T; i++ {
-			orInfos[i].Lock()
-			totalOrs += len(orInfos[i].startTimes)
-			orInfos[i].Unlock()
-		}
-
-		// Log summary to lattput file
-		lattputFile.WriteString(fmt.Sprintf("%d %f %f %d %d %f\n", endTime.UnixNano(),
-			avg, tput, count, totalOrs, avgCommit))
-
-		startTime = endTime
-	}
+	done <- summary
+	log.Printf("Out of loop2\n")
 }

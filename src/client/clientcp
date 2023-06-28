@@ -1,0 +1,369 @@
+package main
+
+import (
+	"bufio"
+	"config"
+	"dlog"
+	"encoding/gob"
+	"flag"
+	"fmt"
+	"kvproto"
+	"log"
+	"math/rand"
+	"net"
+	"os"
+	"sort"
+	"sync"
+	"time"
+	"util"
+)
+
+var serverId = flag.Int("id", 0, "Id of server")
+var startRange = flag.Int("sr", 0, "Key range start")
+var sport = flag.Int("sport", 7070, "the port of the server")
+
+var openloop = flag.Bool("op", true, "perform open loop testing")
+var separate = flag.Bool("sp", false, "each batch contain one opeartion type")
+
+var INV = uint8(0)
+var RES = uint8(1)
+
+func init() {
+	flag.Parse()
+	dlog.Setup()
+	config.Load()
+}
+
+type Summary struct {
+	AckNum   int
+	TotalLat int64
+	MaxLat   int64
+	Ts       map[int64]int64
+	Size     map[int64]int
+}
+
+type OperationLog struct {
+	Type uint8
+	Op   kvproto.Operation
+	K    kvproto.Key
+	V    kvproto.Value
+	Ts   int64
+}
+
+func main() {
+	b := config.GetConfig().Benchmark
+	conflicts := b.Conflicts
+	readRatio := 1 - b.W
+	reqNum := b.Throttle
+	batchSize := config.GetConfig().BatchSize
+
+	if conflicts > 100 {
+		log.Fatalf("Conflicts percentage must be between 0 and 100.\n")
+	}
+
+	//generating keys
+	tsArray := make([]int64, reqNum)
+	ackTsArray := make([]int64, reqNum)
+	//is it a read
+	readArray := make([]bool, reqNum)
+	kArray := make([]int64, reqNum)
+	ticketChan := make(chan int64, reqNum)
+	ts := util.MakeTimestamp()
+	for i := 0; i < reqNum; i++ {
+		ticketChan <- ts + int64(i)
+	}
+
+	zipGenerator := util.NewZipfianWithItems(int64(b.K), b.ZipfianTheta)
+	seed := rand.New(rand.NewSource(time.Now().UTC().UnixNano()))
+	for i := 0; i < reqNum; i++ {
+		if b.Distribution == "zipfan" {
+			kArray[i] = zipGenerator.Next(seed)
+			//log.Printf("Key is %d", kArray[i])
+		} else {
+			r := rand.Intn(100)
+			if r < conflicts {
+				kArray[i] = 42
+			} else {
+				//we don't care about the conflict rate send to the same leader
+				kArray[i] = int64(*startRange + 43 + i)
+			}
+		}
+		tsArray[i] = 0
+		ackTsArray[i] = 0
+	}
+
+	for i := 0; i < reqNum; {
+		bNum := min(batchSize, reqNum-i)
+		isRead := false
+		if rand.Float64() < readRatio {
+			isRead = true
+		}
+		if *separate {
+			for j := 0; j < bNum; j++ {
+				readArray[i] = isRead
+				i++
+			}
+		} else {
+			readArray[i] = isRead
+			i++
+		}
+	}
+
+	outfilelock := &sync.Mutex{}
+	outFileName := "./linearizability.out"
+	f, _ := os.Create(outFileName)
+	defer f.Close()
+	w := bufio.NewWriter(f)
+	//write to linearizabilty out
+	defer w.Flush()
+	if *openloop {
+		server, err := net.Dial("tcp", fmt.Sprintf(":%d", *sport))
+		if err != nil {
+			log.Printf("Error connecting to replica %d\n", *serverId)
+		}
+		reader := bufio.NewReader(server)
+		writer := bufio.NewWriter(server)
+
+		done1 := make(chan Summary)
+		done2 := make(chan Summary)
+		inFlight := make(chan bool, (reqNum/batchSize)+1)
+		go simulatedOpenLoopClient(writer, 0, kArray, readArray, reqNum, done1, inFlight, outfilelock, w)
+		go readResponse(reader, done2, inFlight)
+		clientSummary := <-done1
+		respSummary := <-done2
+		totalCount := respSummary.AckNum
+		totalLatency := int64(0)
+		for tId, ts := range respSummary.Ts {
+			totalLatency += (ts - clientSummary.Ts[tId]) * int64(clientSummary.Size[tId])
+		}
+		log.Printf("Total ack: %d\n", totalCount)
+		log.Printf("Total latency: %d\n", totalLatency)
+		log.Printf("Lat per req: %d\n", totalLatency/int64(totalCount))
+		// reportResult(fmt.Sprintf("%s:%d", *masterAddr, *masterPort), *serverId, totalCount, totalLatency)
+		server.Close()
+	}
+
+	// workerNum := b.Concurrency
+	// reqNumPerClient := reqNum / workerNum
+	// else {
+	// 	done := make(chan Summary, workerNum)
+	// 	for i := 0; i < workerNum; i++ {
+	// 		dlog.Printf("server id : %d, Client %d initiated", *serverId, i)
+	// 		go simulatedClosedLoopClient(i, kArray, readArray, reqNumPerClient, done, ticketChan, outfilelock, w)
+	// 	}
+	// 	//log.Printf("sent: %d, received %d", sent, received)
+	// 	totalLatency := int64(0)
+	// 	totalCount := 0
+	// 	for i := 0; i < workerNum; i++ {
+	// 		clientSummary := <-done
+	// 		totalCount += clientSummary.AckNum
+	// 		totalLatency += clientSummary.TotalLat
+	// 	}
+	// 	log.Printf("Total ack: %d\n", totalCount)
+	// 	log.Printf("Total latency: %d\n", totalLatency)
+	// 	log.Printf("Lat per req: %d\n", totalLatency/int64(totalCount))
+	// 	// reportResult(fmt.Sprintf("%s:%d", *masterAddr, *masterPort), *serverId, totalCount, totalLatency)
+
+	// }
+}
+
+func min(x, y int) int {
+	if x > y {
+		return y
+	}
+	return x
+}
+
+// func simulatedClosedLoopClient(clientId int,
+// 	kArray []int64, rArray []bool, txnNum int, done chan Summary, ticketChan chan int64,
+// 	fileLock *sync.Mutex, fileWriter *bufio.Writer) {
+
+// 	//invOplogArray []OperationLog, resOplogArray []OperationLog
+// 	var err error
+// 	var summary Summary //result summary
+// 	//
+// 	//invOplogArray := make([]OperationLog, txnNum)
+
+// 	server, err := net.Dial("tcp", fmt.Sprintf(":%d", *sport))
+// 	if err != nil {
+// 		log.Printf("Error connecting to replica %d\n", *serverId)
+// 	}
+
+// 	reader := bufio.NewReader(server)
+// 	writer := bufio.NewWriter(server)
+
+// 	//log.Printf("Len of value %d\n", len(state.NIL))
+// 	cmd := kvproto.Command{Op: kvproto.PUT, K: 0, Val: 0}
+
+// 	n := txnNum //per client txn number
+
+// 	log.Printf("Total req num is %d\n", n)
+
+// 	testStart := time.Now()
+
+// 	for i := 0; i < n; {
+// 		ts := util.MakeTimestamp()
+// 		if time.Since(testStart).Seconds() > float64(config.GetConfig().Benchmark.T) {
+// 			break //terminate test
+// 		}
+// 		gobReader := gob.NewDecoder(reader)
+// 		//construct send
+// 		bNum := min(config.GetConfig().BatchSize, n-i)
+// 		var txn kvproto.Transaction
+// 		//write in a batch
+// 		//i_start := i
+// 		for j := 0; j < bNum; j++ {
+// 			cmd.K = kvproto.Key(kArray[clientId*txnNum+i])
+// 			if rArray[i] {
+// 				cmd.Op = kvproto.GET
+// 			} else {
+// 				cmd.Op = kvproto.PUT
+// 				cmd.Val = kvproto.Value(rand.Int63n(10000000))
+// 			}
+// 			txn.Commands = append(txn.Commands, cmd)
+// 			i++
+// 		}
+// 		if rArray[i-1] {
+// 			txn.ReadOnly = 1
+// 		} else {
+// 			txn.ReadOnly = 0
+// 		}
+// 		txn.Ts = ts
+// 		//i_end := i
+// 		//log.Println(i)
+// 		//send out the transaction
+// 		util.SendObject(writer, txn)
+
+// 		start := txn.Ts
+// 		//wait for response
+// 		var response []kvproto.Value
+// 		if err := gobReader.Decode(&response); err != nil {
+// 			fmt.Println("Error when reading:", err)
+// 			continue
+// 		}
+// 		end := util.MakeTimestamp()
+// 		lat := end - start
+// 		summary.AckNum += bNum
+// 		summary.TotalLat += (lat * int64(bNum))
+// 		//log.Printf("Lat is %d", lat)
+// 		if lat > summary.MaxLat {
+// 			summary.MaxLat = lat
+// 		}
+// 	}
+// 	server.Close()
+// 	done <- summary
+// 	log.Printf("Out of loop\n")
+// }
+
+func feedTicket(ticketChan chan int) {
+	reqNum := config.GetConfig().Benchmark.Throttle
+	batchSize := config.GetConfig().BatchSize
+	batchNum := reqNum / batchSize
+	batchInterval := time.Duration(config.GetConfig().Benchmark.T * 1e9 / batchNum)
+	for ticketNum := 0; ticketNum < reqNum; ticketNum++ {
+		//log.Printf("HERE")
+		ticketChan <- ticketNum
+		time.Sleep(batchInterval)
+	}
+}
+
+func simulatedOpenLoopClient(
+	writer *bufio.Writer,
+	clientId int,
+	kArray []int64,
+	rArray []bool,
+	txnNum int,
+	done chan Summary,
+	inFlight chan bool,
+	fileLock *sync.Mutex,
+	fileWriter *bufio.Writer) {
+
+	batchSize := config.GetConfig().BatchSize
+	var summary Summary //result summary
+	summary.Ts = make(map[int64]int64)
+	summary.Size = make(map[int64]int)
+
+	cmd := kvproto.Command{Op: kvproto.PUT, K: 0, Val: 0}
+	n := txnNum //per client txn number
+	bathcNum := (n / batchSize) + 1
+	log.Printf("Total req num is %d\n", n)
+	ticketChan := make(chan int, bathcNum)
+	//rate control
+	go feedTicket(ticketChan)
+
+	timer := time.NewTimer(time.Duration(config.GetConfig().Benchmark.T) * time.Second)
+loop:
+	for i := 0; i < n; {
+		select {
+		case <-timer.C:
+			break loop
+		default:
+			//construct transaction
+			bNum := min(batchSize, n-i)
+			var txn kvproto.Transaction
+			for j := 0; j < bNum; j++ {
+				cmd.K = kvproto.Key(kArray[clientId*txnNum+i])
+				if rArray[i] {
+					cmd.Op = kvproto.GET
+				} else {
+					cmd.Op = kvproto.PUT
+					cmd.Val = kvproto.Value(rand.Int63n(10000000))
+				}
+
+				txn.Commands = append(txn.Commands, cmd)
+				i++
+			}
+
+			if rArray[i-1] {
+				txn.ReadOnly = 1
+			} else {
+				txn.ReadOnly = 0
+			}
+
+			//Hack: sort to make
+			sort.Slice(txn.Commands, func(i, j int) bool {
+				return txn.Commands[i].K < txn.Commands[j].K
+			})
+
+			tId := <-ticketChan
+			txn.Ts = util.MakeTimestamp()
+			txn.TID = int64(tId)
+
+			util.SendObject(writer, txn)
+			inFlight <- true
+			summary.Ts[int64(tId)] = txn.Ts
+			summary.Size[int64(tId)] = bNum
+		}
+	}
+	dlog.Debug("Out of loop\n")
+	done <- summary
+}
+
+func readResponse(reader *bufio.Reader, done chan Summary, inFlight chan bool) {
+	var summary Summary //result summary
+	summary.Ts = make(map[int64]int64)
+	summary.Size = make(map[int64]int)
+	timer := time.NewTimer(time.Duration(config.GetConfig().Benchmark.T) * time.Second)
+loop:
+	for {
+		select {
+		case <-inFlight:
+			gobReader := gob.NewDecoder(reader)
+			//wait for response
+			var response kvproto.Response
+			if err := gobReader.Decode(&response); err != nil {
+				fmt.Println("Error when reading:", err)
+				continue
+			}
+			tsNow := util.MakeTimestamp()
+			summary.AckNum += len(response.Vals)
+			summary.Ts[response.TID] = tsNow
+			summary.Size[response.TID] = len(response.Vals)
+			// <-time.After(10 * time.Millisecond)
+		case <-timer.C:
+			break loop
+		}
+	}
+	dlog.Debug("Out of loop2\n")
+	done <- summary
+}
