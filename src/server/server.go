@@ -16,6 +16,7 @@ import (
 	"runtime"
 	"runtime/pprof"
 	"strconv"
+	"strings"
 )
 
 var id *string = flag.String("id", "0", "ID of replica")
@@ -39,12 +40,12 @@ func main() {
 	config.Print()
 
 	ID := (configuration.ID)(*id)
-	nodeList := make([]string, config.N)
+	nodeList := []string{}
 	for _, addr := range config.Addrs {
 		nodeList = append(nodeList, addr)
 	}
 
-	portNum, _ := strconv.Atoi(config.Ports[ID])
+	portNum, _ := strconv.Atoi(strings.Split(config.Addrs[ID], ":")[1])
 	replicaId, _ := strconv.Atoi(ID)
 	runtime.GOMAXPROCS(*procs)
 

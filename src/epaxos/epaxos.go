@@ -3,6 +3,7 @@ package epaxos
 import (
 	"encoding/binary"
 	"epaxosproto"
+	"fmt"
 	"genericsmr"
 	"genericsmrproto"
 	"io"
@@ -218,7 +219,7 @@ func NewLeaderBookkeeping(proposals []*genericsmr.Propose, deps [DS]int32) *Lead
 		[]int32{-1, -1, -1, -1, -1}, nil, false, false, nil, 0, time.Time{}}
 }
 
-//append a log entry to stable storage
+// append a log entry to stable storage
 func (r *Replica) recordInstanceMetadata(inst *Instance) {
 	if !r.Durable {
 		return
@@ -236,7 +237,7 @@ func (r *Replica) recordInstanceMetadata(inst *Instance) {
 	r.StableStore.Write(b[:])
 }
 
-//write a sequence of commands to stable storage
+// write a sequence of commands to stable storage
 func (r *Replica) recordCommands(cmds []state.Command) {
 	if !r.Durable {
 		return
@@ -250,7 +251,7 @@ func (r *Replica) recordCommands(cmds []state.Command) {
 	}
 }
 
-//sync with the stable store
+// sync with the stable store
 func (r *Replica) sync() {
 	if !r.Durable {
 		return
@@ -304,6 +305,7 @@ func (r *Replica) stopAdapting() {
 ************************************/
 
 func (r *Replica) run() {
+	fmt.Println("Made it here")
 	r.ConnectToPeers()
 
 	go r.WaitForClientConnections()

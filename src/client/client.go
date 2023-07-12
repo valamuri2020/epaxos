@@ -23,7 +23,7 @@ import (
 
 var serverId = flag.Int("id", 0, "Id of server")
 var startRange = flag.Int("sr", 0, "Key range start")
-var sport = flag.Int("sport", 7070, "the port of the server")
+var sport = flag.Int("sport", 7074, "the port of the server")
 var separate = flag.Bool("sp", false, "each batch contain one opeartion type")
 var algo = flag.String("algo", "epaxos", "algorithm")
 
@@ -134,7 +134,7 @@ func main() {
 	defer w.Flush()
 	server, err := net.Dial("tcp", fmt.Sprintf(":%d", *sport))
 	if err != nil {
-		log.Printf("Error connecting to replica %d\n", *serverId, err)
+		log.Printf("Error connecting to replica %d at %v. Error is: %v \n", *serverId, fmt.Sprintf("127.0.0.1:%d", *sport), err)
 	}
 	reader := bufio.NewReader(server)
 	writer := bufio.NewWriter(server)

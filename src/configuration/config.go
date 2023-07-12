@@ -5,7 +5,6 @@ import (
 	"fmt"
 	"io/ioutil"
 	"os"
-	"strings"
 )
 
 type ID = string
@@ -49,8 +48,7 @@ type Config struct {
 	BatchSize  int           `json:"batch_size"`
 	BufferSize int           `json:"buffer_size"` // buffer size for maps
 
-	Ports map[ID]string
-	N     int
+	N int
 }
 
 func (config *Config) Load() error {
@@ -59,12 +57,7 @@ func (config *Config) Load() error {
 	byteValue, _ := ioutil.ReadAll(configFile)
 	err := json.Unmarshal(byteValue, &config)
 
-	config.Ports = make(map[ID]string)
-
-	for key, addr := range config.Addrs {
-		addr, port := strings.Split(addr, ":")[0], strings.Split(addr, ":")[1]
-		config.Addrs[key] = addr
-		config.Ports[key] = port
+	for range config.Addrs {
 		config.N++
 	}
 	return err
