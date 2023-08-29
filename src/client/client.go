@@ -132,9 +132,9 @@ func main() {
 	w := bufio.NewWriter(f)
 	//write to linearizabilty out
 	defer w.Flush()
-	server, err := net.Dial("tcp", fmt.Sprintf(":%d", *sport))
+	server, err := net.Dial("tcp", config.Addrs[fmt.Sprint(*serverId)])
 	if err != nil {
-		log.Printf("Error connecting to replica %d at %v. Error is: %v \n", *serverId, fmt.Sprintf("127.0.0.1:%d", *sport), err)
+		log.Printf("Error connecting to replica %d at %v. Error is: %v \n", *serverId, config.Addrs[fmt.Sprint(*serverId)], err)
 	}
 	reader := bufio.NewReader(server)
 	writer := bufio.NewWriter(server)
@@ -355,6 +355,7 @@ func epaxosClient(writer *bufio.Writer,
 		timeInt64 := util.MakeTimestamp(0)
 		for j := 0; j < bNum; j++ {
 			args.Timestamp = timeInt64
+			// cast to a Key type
 			args.Command.K = state.Key(kArray[i])
 			if rArray[i] {
 				args.Command.Op = state.GET

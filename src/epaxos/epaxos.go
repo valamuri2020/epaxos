@@ -3,7 +3,6 @@ package epaxos
 import (
 	"encoding/binary"
 	"epaxosproto"
-	"fmt"
 	"genericsmr"
 	"genericsmrproto"
 	"io"
@@ -305,7 +304,6 @@ func (r *Replica) stopAdapting() {
 ************************************/
 
 func (r *Replica) run() {
-	fmt.Println("Made it here")
 	r.ConnectToPeers()
 
 	go r.WaitForClientConnections()

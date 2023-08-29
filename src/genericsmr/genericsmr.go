@@ -172,9 +172,14 @@ func (r *Replica) ConnectToPeers() {
 func (r *Replica) waitForPeerConnections(done chan bool) {
 	var b [4]byte
 	bs := b[:4]
-
-	r.Listener, _ = net.Listen("tcp", r.PeerAddrList[r.Id])
+	fmt.Printf("r.PeerAddrList is %v, r.ID is %v \n", r.PeerAddrList, r.Id)
+	var listen_err error
+	r.Listener, listen_err = net.Listen("tcp", r.PeerAddrList[r.Id])
+	if listen_err != nil {
+		fmt.Printf("Error in net.Listen %v\n", listen_err)
+	}
 	for i := r.Id + 1; i < int32(r.N); i++ {
+		fmt.Printf("IS r.Listener NIL? %v\n", r.Listener == nil)
 		conn, err := r.Listener.Accept()
 		if err != nil {
 			fmt.Println("Accept error:", err)
@@ -189,7 +194,7 @@ func (r *Replica) waitForPeerConnections(done chan bool) {
 		r.PeerReaders[id] = bufio.NewReader(conn)
 		r.PeerWriters[id] = bufio.NewWriter(conn)
 		r.Alive[id] = true
-
+		fmt.Println("--- Created connection to", r.Peers[id])
 		go r.replicaListener(int(id), r.PeerReaders[id])
 	}
 

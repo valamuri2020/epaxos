@@ -5,7 +5,6 @@ import (
 	"genericsmrproto"
 	"sort"
 	"state"
-	"time"
 )
 
 const (
@@ -162,13 +161,16 @@ func (e *Exec) strongconnect(v *Instance, index *int) bool {
 					w.lb != nil && w.lb.clientProposals != nil {
 					e.r.ReplyPropose(
 						&genericsmrproto.ProposeReply{
-							TRUE,
-							w.lb.clientProposals[idx].CommandId,
-							val,
+							OK:        TRUE,
+							CommandId: w.lb.clientProposals[idx].CommandId,
+							Value:     val,
 							// w.lb.clientProposals[idx].Timestamp
+
+							Timestamp: w.lb.clientProposals[idx].Timestamp,
 							// Overload timestamp with time between commit and
 							// execution
-							time.Now().Sub(w.lb.commitTime).Nanoseconds()},
+							// time.Now().Sub(w.lb.commitTime).Nanoseconds()
+						},
 						w.lb.clientProposals[idx].Reply)
 				}
 			}

@@ -37,7 +37,6 @@ var clockSyncEpsilon = flag.Float64("clockepsilon", 4, "The number of millisecon
 func main() {
 	flag.Parse()
 	config := configuration.GetConfig()
-	config.Print()
 
 	ID := (configuration.ID)(*id)
 	nodeList := []string{}
